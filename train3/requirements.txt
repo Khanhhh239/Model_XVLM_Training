@@ -1,0 +1,17 @@
+# Core (Model A SigLIP training + inference + tests)
+torch>=2.1
+torchvision
+numpy
+pandas
+pyarrow
+pillow
+pyyaml
+pytest
+
+# Real backbone (skip for CPU/dummy tests)
+transformers>=4.49   # SigLIP-2 support
+peft>=0.10
+
+# Data-prep (optional, the data team)
+# spacy            # noun-phrase extraction for GroundingDINO pseudo-labels
+# groundingdino    # phrase->box pseudo-labels for bbox_head (Phase 3)

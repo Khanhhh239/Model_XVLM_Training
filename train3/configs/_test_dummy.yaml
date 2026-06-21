@@ -1,0 +1,34 @@
+# Tiny config for unit tests / CPU smoke (no downloads).
+model:
+  name: dummy
+  embed_dim: 64
+  patch: 16
+  image_size: 32
+  vocab_size: 1000
+
+data:
+  manifest: ""
+  image_root: ""
+  image_size: 32
+  max_token: 16
+  num_workers: 0
+  sampler: balanced
+
+train:
+  batch_size: 8
+  seed: 42
+
+optim:
+  lr: 1.0e-3
+  wd: 0.0
+  epochs: 1
+  grad_clip: 1.0
+  bf16: false
+  grad_checkpoint: false
+  ema: true
+  ema_decay: 0.9
+  use_filip: false
+  w_filip: 0.5
+
+aug:
+  crop_min: 0.8

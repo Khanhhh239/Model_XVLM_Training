@@ -1,0 +1,51 @@
+# X-VLM-v4 cross-encoder (Model B / Phase 3) -- 1x A100 80GB.
+# Self-contained cross-encoder on HF Swin (image) + BERT (text).  For the real submission you
+# may instead warm-start the pretrained X-VLM in .. (set optim.warm_start) to reuse its
+# pretrained ITM cross-encoder; the heads/losses/trainer here are identical machinery.
+model:
+  name: hf
+  image_model: microsoft/swin-base-patch4-window7-224
+  text_model: bert-base-uncased
+  embed_dim: 256
+  cross_layers: 6
+  cross_heads: 8
+  num_anomaly_classes: 3
+  # First 94% attempt: keep the cheap/free heads, drop the costly/risky ones (review D4).
+  #  - box  needs a ~10-20h GroundingDINO pseudo-label pass to be non-trivial -> enable later
+  #  - pose needs ViTPose on the 36K gallery at inference -> enable once that pipeline exists
+  use_pose: false
+  use_anomaly: true            # label is FREE (synthetic bucket)
+  use_box: false
+  use_filip: true              # no extra labels (reuses ITC pairs); helps verbs (#2/#4)
+  filip_dim: 256
+
+data:
+  manifest: data/manifest_1m.parquet
+  image_root: data/images
+  image_size: 512
+  max_token: 64
+  num_workers: 16
+  sampler: pair                # same-video hard pairs (structural hard negatives)
+
+train:
+  batch_size: 64               # A100 80GB (ITM adds 3x cross-encoder forwards)
+  seed: 42
+
+optim:
+  lr: 2.0e-4
+  wd: 0.05
+  epochs: 12                   # Stage A(4) warm-start ITM -> B(6) all heads -> C(2) FixRes 768
+  warmup_epochs: 1             # cosine warmup (review fix A3)
+  grad_clip: 1.0
+  bf16: true
+  grad_checkpoint: true
+  ema: true
+  ema_decay: 0.999
+  queue_size: 65536            # MoCo negatives for ITC
+  warm_start: null             # e.g. ../.../best.pth (load weights only)
+  w_itc: 1.0
+  w_itm: 1.5                   # boosted -- the v3 fine-tune insight (+1.7% mAP)
+  w_filip: 0.5
+  w_box: 0.5
+  w_anom: 0.3
+  w_smoothap: 0.2
