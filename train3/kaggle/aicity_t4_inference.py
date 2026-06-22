@@ -47,6 +47,10 @@ CACHE     = f"{WORK}/cache";  os.makedirs(CACHE, exist_ok=True)
 device    = "cuda" if torch.cuda.is_available() else "cpu"
 GALLERY_CHUNK = 2000          # images per resume-chunk
 K_TEST    = 128               # ITM rerank top-K (CMP default)
+# ---- BOOST FLAGS (the MASTER RUN at the end honors these) ----
+USE_TTA  = True               # flip-TTA on gallery feature  (+~0.5-1%, costs ~+45min re-encode)
+USE_POSE = False              # EXPERIMENTAL pose-ON: ~+2h AND MAY HURT (render is a guess). Set True to try.
+RUN_QWEN = True               # Qwen2-VL rerank in an isolated subprocess (handles the transformers clash). LONG on T4, resumable.
 print("device:", device, "| torch:", torch.__version__)
 
 # ---- clone CMP code + startv4 helpers (Internet=ON). No internet? upload these repos as datasets. ----
@@ -331,10 +335,8 @@ def save_candidates_for_lmm(score_t2i, k=64, out=f"{WORK}/lmm_candidates.pt"):
                 "score": score_t2i.gather(1, idx).cpu()}, out)
     print("saved LMM candidates ->", out)
 
-# CELL 6 — runs automatically on "Run All" -> writes /kaggle/working/answer.txt
-SCORE = build_final_score(keep_dual=True, keep_kr=False, keep_itm=True)   # CMP ITC + dual-softmax + ITM rerank
-write_submission(SCORE)                  # -> /kaggle/working/answer.txt  (download + submit this)
-save_candidates_for_lmm(SCORE)           # for optional Qwen rerank later (CELL 8, separate kernel)
+# NOTE: the actual run is the MASTER RUN cell at the very end (it honors USE_TTA/USE_POSE/RUN_QWEN).
+# These are function definitions only.
 
 
 # ============================== CELL 7 — OPTIONAL encode boosts (run, then RE-RUN CELL 6) ==============================
@@ -396,46 +398,76 @@ def encode_gallery_pose(gal_dir, pose_dir, names, bs=16):
 print("CELL 7 ready: encode_gallery_tta / gen_pose_maps+encode_gallery_pose (optional, re-run CELL 6 after).")
 
 
-# ============================== CELL 8 — Qwen2-VL AnomalyLMM rerank (RUN IN A SEPARATE KERNEL) ==============================
-# Qwen2-VL needs transformers>=4.45 but CMP needs 4.44 -> they CANNOT share a kernel. Workflow:
-#   1) In the CMP kernel: run CELL 6 incl. save_candidates_for_lmm(SCORE) -> /kaggle/working/lmm_candidates.pt
-#   2) Open a NEW notebook (same datasets), set RUN_QWEN=True, run ONLY this cell. It rewrites answer.txt.
-# Honest: rerank touches PRECISION not recall; ~+1-2 mAP, slow (~hours), resumable. Keep only if it helps.
-RUN_QWEN = False
+# ============================== CELL 8 — Qwen2-VL rerank as an ISOLATED SUBPROCESS ==============================
+# Qwen2-VL needs transformers>=4.45 but CMP needs 4.44 -> can't share imports. We run Qwen in a CHILD process
+# (fresh interpreter) AFTER pip-upgrading transformers, so the main kernel's CMP (already finished) is untouched.
+# Resumable: saves qwen_scores.pt every 25 queries -> if the session ends, just re-run and it continues.
+QWEN_SCRIPT = r'''
+import os, torch
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from PIL import Image
+WORK = "/kaggle/working"
+d = torch.load(f"{WORK}/lmm_candidates.pt")
+MODEL = os.environ.get("QWEN_MODEL", "Qwen/Qwen2-VL-2B-Instruct")
+TOPK  = int(os.environ.get("QWEN_TOPK", "8"))
+mdl = Qwen2VLForConditionalGeneration.from_pretrained(MODEL, torch_dtype="auto", device_map="auto").eval()
+proc = AutoProcessor.from_pretrained(MODEL)
+done = f"{WORK}/qwen_scores.pt"
+scores = torch.load(done) if os.path.exists(done) else {}
+for qi, (cap, cands) in enumerate(zip(d["caps"], d["cand"])):
+    if str(qi) in scores: continue
+    sc = []
+    for nm in cands[:TOPK]:
+        img = Image.open(f"{d['gal_dir']}/{nm}").convert("RGB")
+        msg = [{"role": "user", "content": [{"type": "image", "image": img},
+                {"type": "text", "text": f"On a scale 0-100, how well does this image match: '{cap}'? Reply only a number."}]}]
+        t = proc.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
+        inp = proc(text=[t], images=[img], return_tensors="pt").to(mdl.device)
+        out = mdl.generate(**inp, max_new_tokens=6)
+        ans = proc.batch_decode(out[:, inp.input_ids.shape[1]:], skip_special_tokens=True)[0]
+        num = "".join(c for c in ans if c.isdigit())
+        sc.append(float(num) if num else 0.0)
+    scores[str(qi)] = sc
+    if qi % 25 == 0: torch.save(scores, done); print("qwen", qi, "/", len(d["caps"]), flush=True)
+torch.save(scores, done)
+with open(f"{WORK}/answer.txt", "w", encoding="utf-8") as f:        # Qwen score primary, original order tiebreak
+    for qi, cands in enumerate(d["cand"]):
+        s = scores.get(str(qi), [])
+        order = sorted(range(len(cands)), key=lambda j: (-(s[j] if j < len(s) else -1), j))
+        f.write(" ".join(cands[j] for j in order[:10]) + "\n")
+print("DONE: answer.txt rewritten with Qwen rerank")
+'''
+def run_qwen_subprocess(model="Qwen/Qwen2-VL-2B-Instruct", topk=8):
+    with open(f"{WORK}/qwen_rerank.py", "w", encoding="utf-8") as f: f.write(QWEN_SCRIPT)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                    "transformers>=4.45,<5", "qwen-vl-utils", "accelerate"], check=False)
+    env = dict(os.environ, QWEN_MODEL=model, QWEN_TOPK=str(topk))
+    subprocess.run([sys.executable, f"{WORK}/qwen_rerank.py"], env=env, check=False)
+print("CELL 8 ready: run_qwen_subprocess() — called by the MASTER RUN if RUN_QWEN.")
+
+
+# ============================== CELL 9 — MASTER RUN (honors BOOST FLAGS -> writes answer.txt) ==============================
+if USE_POSE:
+    print(">> POSE-ON (experimental): rebuild pose-on model + generate pose maps + re-encode gallery (~+2h, may HURT).")
+    config["be_pose_img"] = True
+    model = Search(config=config)
+    try: model.load_pretrained(CKPT)
+    except Exception:
+        _sd = torch.load(CKPT, map_location="cpu", weights_only=False); model.load_state_dict(_sd.get("model", _sd), strict=False)
+    model = model.to(device).half().eval()
+    gen_pose_maps(GAL_DIR, GAL_NAMES)
+    G_EMB, G_FEAT = encode_gallery_pose(GAL_DIR, f"{WORK}/pose", GAL_NAMES)
+
+if USE_TTA:
+    print(">> TTA flip: re-encoding gallery ITC feature (averaged over horizontal flip).")
+    G_FEAT = encode_gallery_tta(GAL_DIR, GAL_NAMES)
+
+SCORE = build_final_score(keep_dual=True, keep_kr=False, keep_itm=True)   # CMP ITC + dual-softmax + ITM rerank
+write_submission(SCORE)                  # baseline answer.txt FIRST (failure-safe; survives Qwen failure/timeout)
+save_candidates_for_lmm(SCORE)
+
 if RUN_QWEN:
-    os.system("pip install -q 'transformers>=4.45' qwen-vl-utils accelerate")
-    import torch as _t
-    from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-    from PIL import Image as _Img
-    WORK = "/kaggle/working"
-    d = _t.load(f"{WORK}/lmm_candidates.pt")
-    mdl = Qwen2VLForConditionalGeneration.from_pretrained(
-        "Qwen/Qwen2-VL-7B-Instruct", torch_dtype="auto", device_map="auto")
-    proc = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
-    TOPK_RR = 10                                  # rerank the top-10 per query (raise if time allows)
-    done = f"{WORK}/qwen_scores.pt"
-    scores = _t.load(done) if os.path.exists(done) else {}
-    for qi, (cap, cands) in enumerate(zip(d["caps"], d["cand"])):
-        if str(qi) in scores: continue
-        sc = []
-        for nm in cands[:TOPK_RR]:
-            img = _Img.open(f"{d['gal_dir']}/{nm}").convert("RGB")
-            msg = [{"role": "user", "content": [{"type": "image", "image": img},
-                    {"type": "text", "text": f"On a scale 0-100, how well does this image match: '{cap}'? Reply only the number."}]}]
-            txt = proc.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
-            inp = proc(text=[txt], images=[img], return_tensors="pt").to(mdl.device)
-            out = mdl.generate(**inp, max_new_tokens=8)
-            ans = proc.batch_decode(out[:, inp.input_ids.shape[1]:], skip_special_tokens=True)[0]
-            num = "".join(c for c in ans if c.isdigit())
-            sc.append(float(num) if num else 0.0)
-        scores[str(qi)] = sc
-        if qi % 50 == 0: _t.save(scores, done); print("qwen", qi, "/", len(d["caps"]))
-    _t.save(scores, done)
-    with open(f"{WORK}/answer.txt", "w", encoding="utf-8") as f:    # Qwen score primary, original order tiebreak
-        for qi, cands in enumerate(d["cand"]):
-            s = scores.get(str(qi), [])
-            order = sorted(range(len(cands)), key=lambda j: (-(s[j] if j < len(s) else 0), j))
-            f.write(" ".join(cands[j] for j in order[:10]) + "\n")
-    print("wrote answer.txt with Qwen rerank")
-else:
-    print("CELL 8 idle. Set RUN_QWEN=True in a SEPARATE kernel (transformers>=4.45) to rerank.")
+    print(">> Qwen rerank (isolated subprocess; pip-upgrades transformers in a child process; long but resumable).")
+    run_qwen_subprocess()                # overwrites answer.txt with the Qwen-reranked ranking
+
+print("FINAL -> /kaggle/working/answer.txt  (download + submit)")
