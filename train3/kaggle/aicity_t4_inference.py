@@ -149,7 +149,7 @@ def _encode_image_batch(paths):
     imgs = torch.stack([TF(Image.open(p).convert("RGB")) for p in paths]).to(device).half()
     emb, _ = model.get_vision_embeds(imgs)            # [B, L, D]
     feat = F.normalize(model.get_image_feat(emb), dim=-1)
-    return emb.float().cpu(), feat.float().cpu()
+    return emb.half().cpu(), feat.float().cpu()       # emb as fp16 -> half the CPU RAM for 36K gallery
 
 @torch.no_grad()
 def encode_gallery(gal_dir, names, chunk=GALLERY_CHUNK, bs=22):
@@ -240,7 +240,10 @@ def itm_rerank(sim_t2i, g_emb, q_emb, q_att, k=K_TEST, bs=64):
 # ============================== CELL 5 — ABLATION MONITOR (anti-destructive) ==============================
 # Build a LABELED distractor-val: queries+GT from old-test attr.json, gallery = old GT + N distractors
 # from the competition gallery. Measure mAP for each technique combo; FLAG any that LOWERS mAP.
-from startv4.eval.metrics import retrieval_metrics  # R@k + mAP (single-GT)
+try:
+    from startv4.eval.metrics import retrieval_metrics  # R@k + mAP (single-GT)
+except Exception as _e:
+    retrieval_metrics = None; print("ablation metrics unavailable (optional, ablation skipped):", _e)
 
 def build_labeled_val(val_dir, n_distract=5000):
     rows = _read_json_any(f"{val_dir}/attr.json")
@@ -328,10 +331,10 @@ def save_candidates_for_lmm(score_t2i, k=64, out=f"{WORK}/lmm_candidates.pt"):
                 "score": score_t2i.gather(1, idx).cpu()}, out)
     print("saved LMM candidates ->", out)
 
-# CELL 6 — uncomment to run the final pipeline and create answer.txt:
-# SCORE = build_final_score(keep_dual=True, keep_kr=False, keep_itm=True)
-# write_submission(SCORE)                 # -> /kaggle/working/answer.txt  (submit this)
-# save_candidates_for_lmm(SCORE)          # optional: feeds Qwen rerank (CELL 8, separate kernel)
+# CELL 6 — runs automatically on "Run All" -> writes /kaggle/working/answer.txt
+SCORE = build_final_score(keep_dual=True, keep_kr=False, keep_itm=True)   # CMP ITC + dual-softmax + ITM rerank
+write_submission(SCORE)                  # -> /kaggle/working/answer.txt  (download + submit this)
+save_candidates_for_lmm(SCORE)           # for optional Qwen rerank later (CELL 8, separate kernel)
 
 
 # ============================== CELL 7 — OPTIONAL encode boosts (run, then RE-RUN CELL 6) ==============================
