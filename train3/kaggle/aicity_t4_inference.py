@@ -46,6 +46,20 @@ if not os.path.isdir(f"{WORK}/MXT"):
                     "https://github.com/Khanhhh239/Model_XVLM_Training", f"{WORK}/MXT"], check=False)
 sys.path.insert(0, f"{WORK}/CMP")
 sys.path.insert(0, f"{WORK}/MXT/train3")          # -> import startv4.eval.rerank / startv4.eval.metrics
+
+# ---- patch CMP models/bert.py for MODERN transformers (it was written for transformers <4.13) ----
+# apply_chunking_to_forward & friends moved modeling_utils -> pytorch_utils (v4.13); file_utils -> utils.
+_bp = f"{WORK}/CMP/models/bert.py"
+if os.path.exists(_bp):
+    _s = open(_bp, encoding="utf-8").read()
+    _s = _s.replace("from transformers.file_utils import", "from transformers.utils import")
+    _s = _s.replace(
+        "from transformers.modeling_utils import (\n    PreTrainedModel,\n    apply_chunking_to_forward,\n    find_pruneable_heads_and_indices,\n    prune_linear_layer,\n)",
+        "from transformers.modeling_utils import PreTrainedModel\n"
+        "from transformers.pytorch_utils import (\n    apply_chunking_to_forward,\n    find_pruneable_heads_and_indices,\n    prune_linear_layer,\n)")
+    open(_bp, "w", encoding="utf-8").write(_s)
+    print("patched bert.py for modern transformers")
+
 # deps usually present on Kaggle; install the few that may be missing
 for pkg in ["ruamel.yaml", "prettytable", "timm"]:
     try: __import__(pkg.split(".")[0])
