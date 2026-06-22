@@ -409,13 +409,22 @@ from PIL import Image
 WORK = "/kaggle/working"
 d = torch.load(f"{WORK}/lmm_candidates.pt")
 MODEL = os.environ.get("QWEN_MODEL", "Qwen/Qwen2-VL-2B-Instruct")
-TOPK  = int(os.environ.get("QWEN_TOPK", "8"))
+TOPK  = int(os.environ.get("QWEN_TOPK", "5"))            # rerank only top-5 candidates
+FRAC  = float(os.environ.get("QWEN_FRAC", "0.5"))        # rerank only the least-confident FRAC of queries
+# SPEED: cap image tokens (generate cost ~ #image tokens; default Qwen2-VL uses up to ~1280/img)
 mdl = Qwen2VLForConditionalGeneration.from_pretrained(MODEL, torch_dtype="auto", device_map="auto").eval()
-proc = AutoProcessor.from_pretrained(MODEL)
+proc = AutoProcessor.from_pretrained(MODEL, min_pixels=64*28*28, max_pixels=128*28*28)
+# SELECTIVE: only rerank queries where CMP is unsure (small top1-top2 margin); keep CMP order for the rest
+sc_cmp = d["score"]                                      # [Q, K_saved]
+margin = (sc_cmp[:, 0] - sc_cmp[:, 1]) if sc_cmp.shape[1] > 1 else torch.zeros(len(d["cand"]))
+n_rr = int(len(d["cand"]) * FRAC)
+to_rr = set(torch.argsort(margin)[:n_rr].tolist())
 done = f"{WORK}/qwen_scores.pt"
 scores = torch.load(done) if os.path.exists(done) else {}
-for qi, (cap, cands) in enumerate(zip(d["caps"], d["cand"])):
-    if str(qi) in scores: continue
+todo = [qi for qi in sorted(to_rr) if str(qi) not in scores]
+print(f"Qwen rerank {len(todo)} queries (FRAC={FRAC}, TOPK={TOPK}, capped img tokens)", flush=True)
+for n, qi in enumerate(todo):
+    cap, cands = d["caps"][qi], d["cand"][qi]
     sc = []
     for nm in cands[:TOPK]:
         img = Image.open(f"{d['gal_dir']}/{nm}").convert("RGB")
@@ -423,21 +432,21 @@ for qi, (cap, cands) in enumerate(zip(d["caps"], d["cand"])):
                 {"type": "text", "text": f"On a scale 0-100, how well does this image match: '{cap}'? Reply only a number."}]}]
         t = proc.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
         inp = proc(text=[t], images=[img], return_tensors="pt").to(mdl.device)
-        out = mdl.generate(**inp, max_new_tokens=6)
+        out = mdl.generate(**inp, max_new_tokens=4)
         ans = proc.batch_decode(out[:, inp.input_ids.shape[1]:], skip_special_tokens=True)[0]
         num = "".join(c for c in ans if c.isdigit())
         sc.append(float(num) if num else 0.0)
     scores[str(qi)] = sc
-    if qi % 25 == 0: torch.save(scores, done); print("qwen", qi, "/", len(d["caps"]), flush=True)
+    if n % 25 == 0: torch.save(scores, done); print("qwen", n, "/", len(todo), flush=True)
 torch.save(scores, done)
-with open(f"{WORK}/answer.txt", "w", encoding="utf-8") as f:        # Qwen score primary, original order tiebreak
+with open(f"{WORK}/answer.txt", "w", encoding="utf-8") as f:
     for qi, cands in enumerate(d["cand"]):
-        s = scores.get(str(qi), [])
-        order = sorted(range(len(cands)), key=lambda j: (-(s[j] if j < len(s) else -1), j))
-        f.write(" ".join(cands[j] for j in order[:10]) + "\n")
+        s = scores.get(str(qi))
+        order = sorted(range(len(cands)), key=lambda j: (-(s[j] if j < len(s) else -1), j)) if s else list(range(len(cands)))
+        f.write(" ".join(cands[j] for j in order[:10]) + "\n")     # reranked queries by Qwen; confident ones keep CMP order
 print("DONE: answer.txt rewritten with Qwen rerank")
 '''
-def run_qwen_subprocess(model="Qwen/Qwen2-VL-2B-Instruct", topk=8):
+def run_qwen_subprocess(model="Qwen/Qwen2-VL-2B-Instruct", topk=5):
     with open(f"{WORK}/qwen_rerank.py", "w", encoding="utf-8") as f: f.write(QWEN_SCRIPT)
     subprocess.run([sys.executable, "-m", "pip", "install", "-q",
                     "transformers>=4.45,<5", "qwen-vl-utils", "accelerate"], check=False)
@@ -463,7 +472,8 @@ if USE_TTA:
     G_FEAT = encode_gallery_tta(GAL_DIR, GAL_NAMES)
 
 SCORE = build_final_score(keep_dual=True, keep_kr=False, keep_itm=True)   # CMP ITC + dual-softmax + ITM rerank
-write_submission(SCORE)                  # baseline answer.txt FIRST (failure-safe; survives Qwen failure/timeout)
+write_submission(SCORE, out=f"{WORK}/answer_cmp.txt")   # CMP baseline kept SEPARATELY (submit to compare vs Qwen)
+write_submission(SCORE)                  # answer.txt (Qwen overwrites this; failure-safe if Qwen dies/times out)
 save_candidates_for_lmm(SCORE)
 
 if RUN_QWEN:
