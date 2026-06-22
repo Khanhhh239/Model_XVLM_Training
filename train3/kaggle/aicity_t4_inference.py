@@ -25,13 +25,22 @@ subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers==4.4
 import numpy as np, torch
 import torch.nn.functional as F
 
-# ---- Kaggle dataset mount points ----
-TEST_DIR  = "/kaggle/input/aicity-official-test/name-masked_test-set"   # gallery/ + query_text.json + query_index.txt
-CMP_DIR   = "/kaggle/input/cmp-models"                                   # cmp.pth + bert vocab/tokenizer/config (flat, no subdir)
-CKPT      = f"{CMP_DIR}/cmp.pth"
-BERT_DIR  = CMP_DIR          # bert files (vocab.txt/tokenizer*/config.json) are FLAT inside cmp-models, not in a subfolder
-# OPTIONAL: if you upload old_test-set as a separate dataset to measure locally, set VAL_DIR; otherwise left None
-VAL_DIR   = None             # set to "/kaggle/input/aicity-old-labeled" if you add that dataset for ablation testing
+# ---- Kaggle dataset paths: AUTO-DETECTED under /kaggle/input (robust to whatever slug/nesting you used) ----
+def _find(pat, root="/kaggle/input"):
+    hits = sorted(glob.glob(f"{root}/**/{pat}", recursive=True))
+    return hits[0] if hits else None
+
+_ckpt  = _find("cmp.pth")
+_vocab = _find("vocab.txt")
+_qtext = _find("query_text.json")
+CKPT     = _ckpt or "/kaggle/input/cmp-models/cmp.pth"
+CMP_DIR  = os.path.dirname(CKPT)
+BERT_DIR = os.path.dirname(_vocab) if _vocab else CMP_DIR        # dir that actually holds vocab.txt/tokenizer*
+TEST_DIR = os.path.dirname(_qtext) if _qtext else "/kaggle/input/aicity-official-test/name-masked_test-set"
+VAL_DIR  = None             # optional labeled set for local ablation (CELL 5); leave None to just submit
+print("CKPT    :", CKPT)
+print("BERT_DIR:", BERT_DIR, "| has vocab.txt:", os.path.exists(f"{BERT_DIR}/vocab.txt"))
+print("TEST_DIR:", TEST_DIR, "| has gallery/:", os.path.isdir(f"{TEST_DIR}/gallery"))
 
 WORK      = "/kaggle/working"
 CACHE     = f"{WORK}/cache";  os.makedirs(CACHE, exist_ok=True)
