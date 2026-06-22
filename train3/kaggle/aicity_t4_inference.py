@@ -19,6 +19,9 @@
 
 # ============================== CELL 0 — setup & paths ==============================
 import os, sys, json, time, glob, math, subprocess
+# ---- pin transformers to a CMP/X-VLM-compatible version (modern 5.x removed APIs bert.py needs) ----
+# Run this cell on a FRESH kernel (Restart) so the import in CELL 1 picks up 4.44.2.
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers==4.44.2"], check=False)
 import numpy as np, torch
 import torch.nn.functional as F
 
@@ -56,7 +59,12 @@ if os.path.exists(_bp):
     _s = _s.replace(
         "from transformers.modeling_utils import (\n    PreTrainedModel,\n    apply_chunking_to_forward,\n    find_pruneable_heads_and_indices,\n    prune_linear_layer,\n)",
         "from transformers.modeling_utils import PreTrainedModel\n"
-        "from transformers.pytorch_utils import (\n    apply_chunking_to_forward,\n    find_pruneable_heads_and_indices,\n    prune_linear_layer,\n)")
+        "from transformers.pytorch_utils import apply_chunking_to_forward\n"
+        "try:\n"
+        "    from transformers.pytorch_utils import find_pruneable_heads_and_indices, prune_linear_layer\n"
+        "except ImportError:\n"
+        "    def find_pruneable_heads_and_indices(*a, **k): raise NotImplementedError('head pruning unused at inference')\n"
+        "    def prune_linear_layer(*a, **k): raise NotImplementedError('head pruning unused at inference')")
     open(_bp, "w", encoding="utf-8").write(_s)
     print("patched bert.py for modern transformers")
 
