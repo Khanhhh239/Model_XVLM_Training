@@ -311,17 +311,119 @@ def write_submission(score_t2i, out=f"{WORK}/answer.txt", topk=10):
             f.write(" ".join(names) + "\n")
     print(f"✓ wrote {out} ({len(Q_IDS)} queries, top-{topk} each)")
 
+def save_candidates_for_lmm(score_t2i, k=64, out=f"{WORK}/lmm_candidates.pt"):
+    """Save per-query top-k gallery names + scores so a SEPARATE Qwen kernel (CELL 8) can rerank."""
+    idx = score_t2i.topk(k, dim=1).indices
+    torch.save({"qids": Q_IDS, "caps": Q_CAPS, "gal_dir": GAL_DIR,
+                "cand": [[GAL_NAMES[j] for j in idx[i].tolist()] for i in range(len(Q_IDS))],
+                "score": score_t2i.gather(1, idx).cpu()}, out)
+    print("saved LMM candidates ->", out)
+
 # CELL 6 — uncomment to run the final pipeline and create answer.txt:
 # SCORE = build_final_score(keep_dual=True, keep_kr=False, keep_itm=True)
-# write_submission(SCORE)
+# write_submission(SCORE)                 # -> /kaggle/working/answer.txt  (submit this)
+# save_candidates_for_lmm(SCORE)          # optional: feeds Qwen rerank (CELL 8, separate kernel)
 
 
-# ============================== CELL 7 — STAGE-2 add-ons (enable AFTER you nothave answer.txt numbers) ==============================
-# (A) POSE-ON: CMP trained with be_pose_img=True. Needs rendered pose-map images for each gallery image
-#     (CMP loads them from image_root/pose/<image>). Generate pose maps (ViTPose->render in CMP's format),
-#     set config["be_pose_img"]=True, and fuse: emb,_=get_vision_embeds(img); pe,_=get_vision_embeds(pose);
-#     emb = model.pose_block(emb, model.pose_conv(pe) if config["pose_conv"] else pe). Verify format vs models/pose.py.
-# (B) AnomalyLMM (Qwen2-VL) cloze rerank: mask verbs/colors in query -> Qwen completes per top-K image -> compare.
-#     Heavy on T4 (top-K x 1978 LMM forwards, ~hours) -> run with resume. Honest: naive Qwen gave ~+1%; expect modest.
-#     Only add if your answer.txt scores suggest you can gain more.
-print("✓ core notebook ready. Output = /kaggle/working/answer.txt (ready to submit).")
+# ============================== CELL 7 — OPTIONAL encode boosts (run, then RE-RUN CELL 6) ==============================
+# (A) TTA flip — average ITC feature over horizontal flip. Cheap, low-risk, small recall gain.
+@torch.no_grad()
+def encode_gallery_tta(gal_dir, names, bs=22):
+    feats = []
+    for i in range(0, len(names), bs):
+        ps = [f"{gal_dir}/{names[j]}" for j in range(i, min(len(names), i+bs))]
+        im = torch.stack([TF(Image.open(p).convert("RGB")) for p in ps]).to(device).half()
+        f1 = F.normalize(model.get_image_feat(model.get_vision_embeds(im)[0]), dim=-1)
+        f2 = F.normalize(model.get_image_feat(model.get_vision_embeds(torch.flip(im, [3]))[0]), dim=-1)
+        feats.append(F.normalize((f1 + f2) / 2, dim=-1).float().cpu())
+    return torch.cat(feats)
+# USE:  G_FEAT = encode_gallery_tta(GAL_DIR, GAL_NAMES)   # then RE-RUN CELL 6
+
+# (B) POSE-ON  (EXPERIMENTAL) — CMP trained with pose, but the masked gallery has NO pose maps and CMP did
+#     NOT release its renderer. We GENERATE COCO-17 skeletons (a GUESS at the format) -> may help or may not.
+#     VERIFY by submitting pose-ON vs pose-OFF answer.txt. ~1h pose-gen + a full re-encode on T4 (resumable).
+#     NOTE: rebuild the model with be_pose_img=True first so pose_conv/pose_block weights are loaded:
+#       config["be_pose_img"]=True; model=Search(config); model.load_pretrained(CKPT); model=model.to(device).half().eval()
+def gen_pose_maps(gal_dir, names, out_dir=f"{WORK}/pose"):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ultralytics"], check=False)
+    from ultralytics import YOLO
+    import cv2
+    os.makedirs(out_dir, exist_ok=True)
+    yolo = YOLO("yolov8n-pose.pt")
+    SK = [(5,7),(7,9),(6,8),(8,10),(5,6),(5,11),(6,12),(11,12),(11,13),(13,15),(12,14),(14,16),(0,5),(0,6)]
+    for nm in names:
+        op = f"{out_dir}/{nm}"
+        if os.path.exists(op): continue
+        im = cv2.imread(f"{gal_dir}/{nm}"); h, w = im.shape[:2]
+        canvas = np.zeros((h, w, 3), np.uint8)
+        r = yolo(f"{gal_dir}/{nm}", verbose=False)[0]
+        if r.keypoints is not None and len(r.keypoints):
+            kp = r.keypoints.xy[0].cpu().numpy()
+            for a, b in SK:
+                if a < len(kp) and b < len(kp):
+                    cv2.line(canvas, tuple(kp[a].astype(int)), tuple(kp[b].astype(int)), (255,255,255), 3)
+            for p in kp: cv2.circle(canvas, tuple(p.astype(int)), 3, (0,255,0), -1)
+        cv2.imwrite(op, canvas)
+    print("pose maps ->", out_dir)
+
+@torch.no_grad()
+def encode_gallery_pose(gal_dir, pose_dir, names, bs=16):
+    EMB, FEAT = [], []
+    for i in range(0, len(names), bs):
+        rng = range(i, min(len(names), i+bs))
+        img  = torch.stack([TF(Image.open(f"{gal_dir}/{names[j]}").convert("RGB"))  for j in rng]).to(device).half()
+        pose = torch.stack([TF(Image.open(f"{pose_dir}/{names[j]}").convert("RGB")) for j in rng]).to(device).half()
+        emb, _ = model.get_vision_embeds(img)
+        pin = model.pose_conv(pose) if getattr(model, "be_pose_conv", False) else pose
+        pe, _ = model.get_vision_embeds(pin)
+        emb = model.pose_block(emb, pe)
+        EMB.append(emb.float().cpu()); FEAT.append(F.normalize(model.get_image_feat(emb), dim=-1).float().cpu())
+    return torch.cat(EMB), torch.cat(FEAT)
+# USE:  gen_pose_maps(GAL_DIR, GAL_NAMES)
+#       G_EMB, G_FEAT = encode_gallery_pose(GAL_DIR, f"{WORK}/pose", GAL_NAMES)   # then RE-RUN CELL 6
+print("CELL 7 ready: encode_gallery_tta / gen_pose_maps+encode_gallery_pose (optional, re-run CELL 6 after).")
+
+
+# ============================== CELL 8 — Qwen2-VL AnomalyLMM rerank (RUN IN A SEPARATE KERNEL) ==============================
+# Qwen2-VL needs transformers>=4.45 but CMP needs 4.44 -> they CANNOT share a kernel. Workflow:
+#   1) In the CMP kernel: run CELL 6 incl. save_candidates_for_lmm(SCORE) -> /kaggle/working/lmm_candidates.pt
+#   2) Open a NEW notebook (same datasets), set RUN_QWEN=True, run ONLY this cell. It rewrites answer.txt.
+# Honest: rerank touches PRECISION not recall; ~+1-2 mAP, slow (~hours), resumable. Keep only if it helps.
+RUN_QWEN = False
+if RUN_QWEN:
+    os.system("pip install -q 'transformers>=4.45' qwen-vl-utils accelerate")
+    import torch as _t
+    from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+    from PIL import Image as _Img
+    WORK = "/kaggle/working"
+    d = _t.load(f"{WORK}/lmm_candidates.pt")
+    mdl = Qwen2VLForConditionalGeneration.from_pretrained(
+        "Qwen/Qwen2-VL-7B-Instruct", torch_dtype="auto", device_map="auto")
+    proc = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
+    TOPK_RR = 10                                  # rerank the top-10 per query (raise if time allows)
+    done = f"{WORK}/qwen_scores.pt"
+    scores = _t.load(done) if os.path.exists(done) else {}
+    for qi, (cap, cands) in enumerate(zip(d["caps"], d["cand"])):
+        if str(qi) in scores: continue
+        sc = []
+        for nm in cands[:TOPK_RR]:
+            img = _Img.open(f"{d['gal_dir']}/{nm}").convert("RGB")
+            msg = [{"role": "user", "content": [{"type": "image", "image": img},
+                    {"type": "text", "text": f"On a scale 0-100, how well does this image match: '{cap}'? Reply only the number."}]}]
+            txt = proc.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
+            inp = proc(text=[txt], images=[img], return_tensors="pt").to(mdl.device)
+            out = mdl.generate(**inp, max_new_tokens=8)
+            ans = proc.batch_decode(out[:, inp.input_ids.shape[1]:], skip_special_tokens=True)[0]
+            num = "".join(c for c in ans if c.isdigit())
+            sc.append(float(num) if num else 0.0)
+        scores[str(qi)] = sc
+        if qi % 50 == 0: _t.save(scores, done); print("qwen", qi, "/", len(d["caps"]))
+    _t.save(scores, done)
+    with open(f"{WORK}/answer.txt", "w", encoding="utf-8") as f:    # Qwen score primary, original order tiebreak
+        for qi, cands in enumerate(d["cand"]):
+            s = scores.get(str(qi), [])
+            order = sorted(range(len(cands)), key=lambda j: (-(s[j] if j < len(s) else 0), j))
+            f.write(" ".join(cands[j] for j in order[:10]) + "\n")
+    print("wrote answer.txt with Qwen rerank")
+else:
+    print("CELL 8 idle. Set RUN_QWEN=True in a SEPARATE kernel (transformers>=4.45) to rerank.")
