@@ -398,61 +398,105 @@ def encode_gallery_pose(gal_dir, pose_dir, names, bs=16):
 print("CELL 7 ready: encode_gallery_tta / gen_pose_maps+encode_gallery_pose (optional, re-run CELL 6 after).")
 
 
-# ============================== CELL 8 — Qwen2-VL rerank as an ISOLATED SUBPROCESS ==============================
-# Qwen2-VL needs transformers>=4.45 but CMP needs 4.44 -> can't share imports. We run Qwen in a CHILD process
-# (fresh interpreter) AFTER pip-upgrading transformers, so the main kernel's CMP (already finished) is untouched.
-# Resumable: saves qwen_scores.pt every 25 queries -> if the session ends, just re-run and it continues.
+# ============================== CELL 8 — AnomalyLMM cloze rerank (ISOLATED SUBPROCESS) ==============================
+# Faithful AnomalyLMM (arxiv 2509.04376): mask action-verbs/colors in the query -> LMM fills them from each image
+# -> semantic match (filled vs gold) -> S = 0.95*match + 0.075*0.5^pos, rerank top-N=3. Honest: paper gain is only
+# +0.96% R@1 on the EASY 1978 gallery over a WEAKER base (X2VLM) -> expect ~0-1% here; measure vs answer_cmp.txt.
+# Qwen needs transformers>=4.45 but CMP needs 4.44 -> run in a CHILD process. Resumable every 25 queries.
 QWEN_SCRIPT = r'''
-import os, torch
+# === AnomalyLMM (faithful): masked cross-modal cloze -> LMM fill -> semantic match -> alpha-fused rerank of top-N ===
+import os, re, torch
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from sentence_transformers import SentenceTransformer
 from PIL import Image
+import nltk
+for pkg in ("averaged_perceptron_tagger", "averaged_perceptron_tagger_eng", "punkt", "punkt_tab"):
+    try: nltk.download(pkg, quiet=True)
+    except Exception: pass
+from nltk import pos_tag, word_tokenize
+
 WORK = "/kaggle/working"
 d = torch.load(f"{WORK}/lmm_candidates.pt")
 MODEL = os.environ.get("QWEN_MODEL", "Qwen/Qwen2-VL-2B-Instruct")
-TOPK  = int(os.environ.get("QWEN_TOPK", "5"))            # rerank only top-5 candidates
-FRAC  = float(os.environ.get("QWEN_FRAC", "0.5"))        # rerank only the least-confident FRAC of queries
-# SPEED: cap image tokens (generate cost ~ #image tokens; default Qwen2-VL uses up to ~1280/img)
+N     = int(os.environ.get("ALMM_TOPN", "3"))           # rerank top-N (paper: 3)
+A1, A2, BETA = 0.95, 0.075, 0.5                         # S = a1*S_match + a2*beta^pos (paper params)
+COLORS = {"red","orange","yellow","green","blue","purple","pink","brown","black","white","gray",
+          "grey","beige","tan","gold","silver","dark","light","navy","maroon","teal","cyan","violet","khaki"}
+STOPV = {"is","are","was","were","be","been","being","has","have","had","do","does","did","'s","s"}
+
+def extract_mask(cap):
+    """Replace action verbs -> <VERB> and colors -> <COLOR>; return masked sentence + gold words IN ORDER."""
+    try: tags = pos_tag(word_tokenize(cap))
+    except Exception: tags = [(w, "NN") for w in cap.split()]
+    gold, masked = [], []
+    for w, t in tags:
+        wl = w.lower()
+        if t.startswith("VB") and wl not in STOPV:
+            gold.append(wl); masked.append("<VERB>")
+        elif wl in COLORS:
+            gold.append(wl); masked.append("<COLOR>")
+        else:
+            masked.append(w)
+    return " ".join(masked), gold
+
 mdl = Qwen2VLForConditionalGeneration.from_pretrained(MODEL, torch_dtype="auto", device_map="auto").eval()
-proc = AutoProcessor.from_pretrained(MODEL, min_pixels=64*28*28, max_pixels=128*28*28)
-# SELECTIVE: only rerank queries where CMP is unsure (small top1-top2 margin); keep CMP order for the rest
-sc_cmp = d["score"]                                      # [Q, K_saved]
-margin = (sc_cmp[:, 0] - sc_cmp[:, 1]) if sc_cmp.shape[1] > 1 else torch.zeros(len(d["cand"]))
-n_rr = int(len(d["cand"]) * FRAC)
-to_rr = set(torch.argsort(margin)[:n_rr].tolist())
-done = f"{WORK}/qwen_scores.pt"
-scores = torch.load(done) if os.path.exists(done) else {}
-todo = [qi for qi in sorted(to_rr) if str(qi) not in scores]
-print(f"Qwen rerank {len(todo)} queries (FRAC={FRAC}, TOPK={TOPK}, capped img tokens)", flush=True)
-for n, qi in enumerate(todo):
-    cap, cands = d["caps"][qi], d["cand"][qi]
+proc = AutoProcessor.from_pretrained(MODEL, min_pixels=64*28*28, max_pixels=160*28*28)  # cap image tokens for speed
+emb = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")                     # semantic word match
+
+def fill(img, masked):
+    msg = [{"role": "user", "content": [{"type": "image", "image": img},
+            {"type": "text", "text": "Fill each placeholder (<VERB>=an action, <COLOR>=a color) with ONE word, "
+             "based ONLY on the image, in order, comma-separated. Write UNKNOWN for a slot you cannot tell.\n"
+             f"Sentence: {masked}"}]}]
+    t = proc.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
+    inp = proc(text=[t], images=[img], return_tensors="pt").to(mdl.device)
+    out = mdl.generate(**inp, max_new_tokens=24, do_sample=False)
+    return proc.batch_decode(out[:, inp.input_ids.shape[1]:], skip_special_tokens=True)[0]
+
+def match_score(preds, gold):
+    """mean cosine(filled, gold) per slot; UNKNOWN/missing -> 0. Captures 'balancing~sliding','dark~gray'."""
+    if not gold: return None
+    ge = emb.encode(gold, convert_to_tensor=True, normalize_embeddings=True)
     sc = []
-    for nm in cands[:TOPK]:
-        img = Image.open(f"{d['gal_dir']}/{nm}").convert("RGB")
-        msg = [{"role": "user", "content": [{"type": "image", "image": img},
-                {"type": "text", "text": f"On a scale 0-100, how well does this image match: '{cap}'? Reply only a number."}]}]
-        t = proc.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
-        inp = proc(text=[t], images=[img], return_tensors="pt").to(mdl.device)
-        out = mdl.generate(**inp, max_new_tokens=4)
-        ans = proc.batch_decode(out[:, inp.input_ids.shape[1]:], skip_special_tokens=True)[0]
-        num = "".join(c for c in ans if c.isdigit())
-        sc.append(float(num) if num else 0.0)
-    scores[str(qi)] = sc
-    if n % 25 == 0: torch.save(scores, done); print("qwen", n, "/", len(todo), flush=True)
+    for k in range(len(gold)):
+        p = preds[k] if k < len(preds) else ""
+        if (not p) or p == "unknown": sc.append(0.0); continue
+        pe = emb.encode([p], convert_to_tensor=True, normalize_embeddings=True)[0]
+        sc.append(float((pe * ge[k]).sum()))
+    return sum(sc) / len(sc)
+
+done = f"{WORK}/qwen_scores.pt"
+scores = torch.load(done) if os.path.exists(done) else {}   # qi -> reranked order (list of candidate indices)
+for qi, (cap, cands) in enumerate(zip(d["caps"], d["cand"])):
+    if str(qi) in scores: continue
+    masked, gold = extract_mask(cap)
+    order = list(range(len(cands)))                          # default = keep CMP order
+    if gold:                                                 # only rerank if there are verbs/colors to verify
+        s1 = []
+        for nm in cands[:N]:
+            img = Image.open(f"{d['gal_dir']}/{nm}").convert("RGB")
+            ans = fill(img, masked)
+            preds = [w.strip().lower() for w in re.split(r"[,\n;]", ans) if w.strip()]
+            s1.append(match_score(preds, gold) or 0.0)
+        S = [A1 * s1[n] + A2 * (BETA ** n) for n in range(len(s1))]   # fuse match + positional prior
+        topn = sorted(range(len(s1)), key=lambda n: -S[n])
+        order = topn + list(range(len(s1), len(cands)))      # reranked top-N, rest unchanged
+    scores[str(qi)] = order
+    if qi % 25 == 0: torch.save(scores, done); print("almm", qi, "/", len(d["caps"]), flush=True)
 torch.save(scores, done)
 with open(f"{WORK}/answer.txt", "w", encoding="utf-8") as f:
     for qi, cands in enumerate(d["cand"]):
-        s = scores.get(str(qi))
-        order = sorted(range(len(cands)), key=lambda j: (-(s[j] if j < len(s) else -1), j)) if s else list(range(len(cands)))
-        f.write(" ".join(os.path.splitext(cands[j])[0] for j in order[:10]) + "\n")   # names WITHOUT extension (challenge format)
-print("DONE: answer.txt rewritten with Qwen rerank")
+        order = scores.get(str(qi), list(range(len(cands))))
+        f.write(" ".join(os.path.splitext(cands[j])[0] for j in order[:10]) + "\n")  # names WITHOUT extension
+print("DONE: AnomalyLMM cloze rerank -> answer.txt")
 '''
-def run_qwen_subprocess(model="Qwen/Qwen2-VL-2B-Instruct", topk=5):
+def run_qwen_subprocess(model="Qwen/Qwen2-VL-2B-Instruct", topn=3):
     with open(f"{WORK}/qwen_rerank.py", "w", encoding="utf-8") as f: f.write(QWEN_SCRIPT)
     subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-                    "transformers>=4.45,<5", "qwen-vl-utils", "accelerate"], check=False)
-    env = dict(os.environ, QWEN_MODEL=model, QWEN_TOPK=str(topk))
+                    "transformers>=4.45,<5", "qwen-vl-utils", "accelerate", "sentence-transformers", "nltk"], check=False)
+    env = dict(os.environ, QWEN_MODEL=model, ALMM_TOPN=str(topn))
     subprocess.run([sys.executable, f"{WORK}/qwen_rerank.py"], env=env, check=False)
-print("CELL 8 ready: run_qwen_subprocess() — called by the MASTER RUN if RUN_QWEN.")
+print("CELL 8 ready: run_qwen_subprocess() = AnomalyLMM cloze rerank (called by MASTER RUN if RUN_QWEN).")
 
 
 # ============================== CELL 9 — MASTER RUN (honors BOOST FLAGS -> writes answer.txt) ==============================
