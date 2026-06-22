@@ -22,13 +22,13 @@ import os, sys, json, time, glob, math, subprocess
 import numpy as np, torch
 import torch.nn.functional as F
 
-# ---- Kaggle dataset mount points (ADJUST to your dataset slugs) ----
+# ---- Kaggle dataset mount points ----
 TEST_DIR  = "/kaggle/input/aicity-official-test/name-masked_test-set"   # gallery/ + query_text.json + query_index.txt
-CMP_DIR   = "/kaggle/input/cmp-models"                                   # cmp.pth + bert-base-uncased/ + (swin/xvlm init)
+CMP_DIR   = "/kaggle/input/cmp-models"                                   # cmp.pth + bert vocab/tokenizer/config (flat, no subdir)
 CKPT      = f"{CMP_DIR}/cmp.pth"
-BERT_DIR  = f"{CMP_DIR}/bert-base-uncased"
-# labeled validation (old test WITH GT) for the ablation monitor (optional but STRONGLY recommended)
-VAL_DIR   = "/kaggle/input/aicity-official-test/old_test-set"            # test/ + attr.json   (adjust if separate dataset)
+BERT_DIR  = CMP_DIR          # bert files (vocab.txt/tokenizer*/config.json) are FLAT inside cmp-models, not in a subfolder
+# OPTIONAL: if you upload old_test-set as a separate dataset to measure locally, set VAL_DIR; otherwise left None
+VAL_DIR   = None             # set to "/kaggle/input/aicity-old-labeled" if you add that dataset for ablation testing
 
 WORK      = "/kaggle/working"
 CACHE     = f"{WORK}/cache";  os.makedirs(CACHE, exist_ok=True)
@@ -236,6 +236,9 @@ def encode_paths(paths, bs=22):
     return torch.cat(embs), torch.cat(feats)
 
 def run_ablation(val_dir, n_distract=5000):
+    if not val_dir or not os.path.isdir(val_dir):
+        print(f"[skip ablation] VAL_DIR not set or missing ({val_dir})")
+        return None
     qcaps, gpaths, qgid, _ = build_labeled_val(val_dir, n_distract)
     print(f"[ablation] queries={len(qcaps)} gallery={len(gpaths)} (incl {n_distract} distractors)")
     qe, qa, qf = encode_queries(qcaps)
@@ -261,7 +264,8 @@ def run_ablation(val_dir, n_distract=5000):
         print(f"  {k:<20} dmAP={v-b:+.4f}  -> {tag}")
     return results
 
-# ABLATION = run_ablation(VAL_DIR, n_distract=5000)   # uncomment when VAL_DIR is set
+# OPTIONAL: uncomment to run ablation if you've added a labeled dataset for VAL_DIR
+# ABLATION = run_ablation(VAL_DIR, n_distract=5000)
 
 
 # ============================== CELL 6 — final pipeline on MASKED set -> submission ==============================
@@ -276,25 +280,26 @@ def build_final_score(keep_dual=True, keep_kr=False, keep_itm=True):
 
 def _minmax(x): return (x - x.min())/(x.max()-x.min()+1e-8)
 
-def write_submission(score_t2i, out=f"{WORK}/submission.txt", topk=10):
+def write_submission(score_t2i, out=f"{WORK}/answer.txt", topk=10):
+    """Write top-10 image names per query to answer.txt (official challenge format)."""
     idx = score_t2i.argsort(dim=1, descending=True)[:, :topk]
     with open(out, "w", encoding="utf-8") as f:
-        for i, qid in enumerate(Q_IDS):
+        for i in range(len(Q_IDS)):
             names = [GAL_NAMES[j] for j in idx[i].tolist()]
-            f.write(" ".join(names) + "\n")              # NOTE: confirm exact submission format vs challenge spec
-    print("wrote", out)
+            f.write(" ".join(names) + "\n")
+    print(f"✓ wrote {out} ({len(Q_IDS)} queries, top-{topk} each)")
 
-# After choosing the config that the ablation says is best:
+# CELL 6 — uncomment to run the final pipeline and create answer.txt:
 # SCORE = build_final_score(keep_dual=True, keep_kr=False, keep_itm=True)
 # write_submission(SCORE)
 
 
-# ============================== CELL 7 — STAGE-2 add-ons (enable after core verified) ==============================
+# ============================== CELL 7 — STAGE-2 add-ons (enable AFTER you nothave answer.txt numbers) ==============================
 # (A) POSE-ON: CMP trained with be_pose_img=True. Needs rendered pose-map images for each gallery image
 #     (CMP loads them from image_root/pose/<image>). Generate pose maps (ViTPose->render in CMP's format),
 #     set config["be_pose_img"]=True, and fuse: emb,_=get_vision_embeds(img); pe,_=get_vision_embeds(pose);
 #     emb = model.pose_block(emb, model.pose_conv(pe) if config["pose_conv"] else pe). Verify format vs models/pose.py.
 # (B) AnomalyLMM (Qwen2-VL) cloze rerank: mask verbs/colors in query -> Qwen completes per top-K image -> compare.
-#     Heavy on T4 (top-K x 1978 LMM forwards, ~hours) -> run with resume; GATE via ablation (keep only if +mAP).
-#     Honest: our earlier naive Qwen rerank gave ~+1%; expect modest. Add LAST, keep only if monitor says +.
-print("core notebook ready. Stage-2 (pose, Qwen) = enable after the core number is validated.")
+#     Heavy on T4 (top-K x 1978 LMM forwards, ~hours) -> run with resume. Honest: naive Qwen gave ~+1%; expect modest.
+#     Only add if your answer.txt scores suggest you can gain more.
+print("✓ core notebook ready. Output = /kaggle/working/answer.txt (ready to submit).")
