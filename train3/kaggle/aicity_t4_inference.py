@@ -37,11 +37,15 @@ GALLERY_CHUNK = 2000          # images per resume-chunk
 K_TEST    = 128               # ITM rerank top-K (CMP default)
 print("device:", device, "| torch:", torch.__version__)
 
-# ---- clone CMP code (no internet? upload CMP repo as a dataset and add its path instead) ----
+# ---- clone CMP code + startv4 helpers (Internet=ON). No internet? upload these repos as datasets. ----
 if not os.path.isdir(f"{WORK}/CMP"):
     subprocess.run(["git", "clone", "--depth", "1",
                     "https://github.com/Shuyu-XJTU/CMP", f"{WORK}/CMP"], check=False)
+if not os.path.isdir(f"{WORK}/MXT"):
+    subprocess.run(["git", "clone", "--depth", "1",
+                    "https://github.com/Khanhhh239/Model_XVLM_Training", f"{WORK}/MXT"], check=False)
 sys.path.insert(0, f"{WORK}/CMP")
+sys.path.insert(0, f"{WORK}/MXT/train3")          # -> import startv4.eval.rerank / startv4.eval.metrics
 # deps usually present on Kaggle; install the few that may be missing
 for pkg in ["ruamel.yaml", "prettytable", "timm"]:
     try: __import__(pkg.split(".")[0])
