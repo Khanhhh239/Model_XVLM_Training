@@ -323,9 +323,9 @@ def write_submission(score_t2i, out=f"{WORK}/answer.txt", topk=10):
     idx = score_t2i.argsort(dim=1, descending=True)[:, :topk]
     with open(out, "w", encoding="utf-8") as f:
         for i in range(len(Q_IDS)):
-            names = [GAL_NAMES[j] for j in idx[i].tolist()]
+            names = [os.path.splitext(GAL_NAMES[j])[0] for j in idx[i].tolist()]   # NAMES WITHOUT extension (challenge format)
             f.write(" ".join(names) + "\n")
-    print(f"✓ wrote {out} ({len(Q_IDS)} queries, top-{topk} each)")
+    print(f"✓ wrote {out} ({len(Q_IDS)} queries, top-{topk} each, names without extension)")
 
 def save_candidates_for_lmm(score_t2i, k=64, out=f"{WORK}/lmm_candidates.pt"):
     """Save per-query top-k gallery names + scores so a SEPARATE Qwen kernel (CELL 8) can rerank."""
@@ -443,7 +443,7 @@ with open(f"{WORK}/answer.txt", "w", encoding="utf-8") as f:
     for qi, cands in enumerate(d["cand"]):
         s = scores.get(str(qi))
         order = sorted(range(len(cands)), key=lambda j: (-(s[j] if j < len(s) else -1), j)) if s else list(range(len(cands)))
-        f.write(" ".join(cands[j] for j in order[:10]) + "\n")     # reranked queries by Qwen; confident ones keep CMP order
+        f.write(" ".join(os.path.splitext(cands[j])[0] for j in order[:10]) + "\n")   # names WITHOUT extension (challenge format)
 print("DONE: answer.txt rewritten with Qwen rerank")
 '''
 def run_qwen_subprocess(model="Qwen/Qwen2-VL-2B-Instruct", topk=5):
@@ -481,3 +481,26 @@ if RUN_QWEN:
     run_qwen_subprocess()                # overwrites answer.txt with the Qwen-reranked ranking
 
 print("FINAL -> /kaggle/working/answer.txt  (download + submit)")
+
+
+# ============================== CELL 10 — fix format (strip extension) + DIRECT download links ==============================
+# Run this cell anytime after a run: it strips .jpg/.png from the answer files (challenge wants names WITHOUT
+# extension) and prints clickable links that download the file straight to your machine.
+import os, base64
+from IPython.display import HTML, display
+
+def finalize_and_download(path):
+    if not os.path.exists(path):
+        print("skip (not found):", path); return
+    s = open(path, encoding="utf-8").read()
+    for ext in (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"):
+        s = s.replace(ext, "")
+    open(path, "w", encoding="utf-8").write(s)
+    name = os.path.basename(path)
+    b64 = base64.b64encode(s.encode()).decode()
+    print(f"✓ {name}: extensions stripped, {s.count(chr(10))} lines")
+    display(HTML(f'<a download="{name}" href="data:text/plain;base64,{b64}" '
+                 f'style="font-size:16px;font-weight:bold;color:#0a0">⬇️ Download {name}</a>'))
+
+finalize_and_download("/kaggle/working/answer.txt")        # Qwen-reranked (or baseline if RUN_QWEN=False)
+finalize_and_download("/kaggle/working/answer_cmp.txt")    # CMP baseline (submit too, to compare vs Qwen)
