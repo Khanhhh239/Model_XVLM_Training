@@ -1,9 +1,26 @@
 # STAR-v4 — Text-Based Person Anomaly Retrieval (AI City 2026 Track 4)
 
-SigLIP-2-L (retrieval / recall + sim2real) **⊕** X-VLM cross-encoder (rerank) **+** ensemble.
-Train on **1× A100 80GB**; infer (and iterate) **free on Kaggle T4** via embedding caching.
-
 > Full design rationale: `../STAR_v4_architecture.md`. This repo is the **implementation**.
+
+## Final architecture (chosen)
+**Retrieve → rerank; two decoupled models meeting only at the SCORE level.**
+1. **RETRIEVAL = SigLIP-2** (`so400m@384` or `large@512`), LoRA + **sigmoid loss**, lr 5e-5 +
+   cosine + EMA, sim2real **augmentation** (blur/JPEG/downscale/erase/text-mask), optional FILIP
+   (chunked). The score driver — recall among the 35K distractors is the competition gap, and
+   SigLIP-2's ~10B real-image pretrain (kept via light LoRA) is the only legal sim2real cure
+   (OOPS! is banned). → `configs/siglip_full1m_a100_40g.yaml` (full 1M) / `siglip_so400m_384.yaml`.
+2. **RERANK = X-VLM ITM cross-encoder** (add ONLY if distractor-val shows the gap is *precision*),
+   warm-started from the pretrained X-VLM at the repo root; ITM-only by default
+   (`configs/xvlm_rerank_only.yaml`), or all heads incl. box-grounding for #3
+   (`configs/xvlm_full_wrongcase.yaml`, needs a GroundingDINO pass).
+3. **Inference (training-free):** encode-once-cache → ensemble (RRF/min-max) → ITM rerank top-K →
+   QE → k-reciprocal → TTA — keep each only if it beats its cost on **distractor-val**.
+
+**Hardware:** 1× A100 **40GB is enough** (SigLIP LoRA @512 batch 48 ≈ 30GB) — right-size, don't
+fill VRAM; no DDP; train Stage 1, measure, add Stage 2 only when proven.
+**Honest expectation:** ~90-93% realistic, 94% the optimistic edge — UNPROVEN until run + measured.
+**Workflow:** `zeroshot_baseline` → train SigLIP (early-stop on distractor-val) → measure
+wrong-cases per category (`scripts/eval_wrong_cases.py`) → add rerank/box only if it helps.
 
 ---
 
