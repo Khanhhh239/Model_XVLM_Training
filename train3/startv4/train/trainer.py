@@ -32,6 +32,7 @@ class SiglipTrainer:
         self.grad_clip = float(o.get_path("grad_clip", 1.0))
         self.use_filip = bool(o.get_path("use_filip", False))
         self.w_filip = float(o.get_path("w_filip", 0.5))
+        self.filip_chunk = int(o.get_path("filip_chunk", 0))  # >0 caps FILIP [B,B,Ni,Nt] memory
         self.warmup_epochs = float(o.get_path("warmup_epochs", 1.0))
         self.sched = None
         self.best_state = None
@@ -56,7 +57,7 @@ class SiglipTrainer:
         logs = {"sigmoid": float(loss.detach())}
         if self.use_filip:
             lf = filip_loss(out["image_tokens"], out["text_tokens"], out["logit_scale"],
-                            batch["attention_mask"].to(self.device))
+                            batch["attention_mask"].to(self.device), chunk=self.filip_chunk)
             loss = loss + self.w_filip * lf
             logs["filip"] = float(lf.detach())
         logs["total"] = float(loss.detach())

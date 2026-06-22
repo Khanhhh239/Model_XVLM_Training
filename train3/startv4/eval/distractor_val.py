@@ -51,3 +51,34 @@ def evaluate_with_distractors(
     sim = query_feat @ gallery.t()                          # [Q, Q+M]
     gt_index = torch.arange(query_feat.size(0), device=query_feat.device)
     return retrieval_metrics(sim, gt_index, ks=ks)
+
+
+def evaluate_by_category(
+    query_feat: torch.Tensor,
+    gt_feat: torch.Tensor,
+    distractor_feat: torch.Tensor,
+    categories: list,
+    ks: tuple[int, ...] = (1, 5, 10),
+) -> dict[str, dict]:
+    """Per-wrong-case-category distractor-val.  Same gallery as evaluate_with_distractors, but
+    metrics are reported per `categories[i]` group (the literal 'does it handle wrong case #k'
+    proof) plus an "__overall__" row.
+    """
+    from collections import defaultdict
+
+    gallery = torch.cat([gt_feat, distractor_feat], dim=0)
+    sim = query_feat @ gallery.t()
+    gt_index = torch.arange(query_feat.size(0), device=query_feat.device)
+
+    groups: dict = defaultdict(list)
+    for i, c in enumerate(categories):
+        groups[str(c)].append(i)
+
+    out: dict[str, dict] = {}
+    for cat, idxs in groups.items():
+        sel = torch.tensor(idxs, device=sim.device)
+        out[cat] = retrieval_metrics(sim[sel], gt_index[sel], ks=ks)
+        out[cat]["n"] = len(idxs)
+    out["__overall__"] = retrieval_metrics(sim, gt_index, ks=ks)
+    out["__overall__"]["n"] = query_feat.size(0)
+    return out
