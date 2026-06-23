@@ -202,9 +202,29 @@ def sim_itc(q_feat, g_feat):
     return (q_feat @ g_feat.t())                          # [Q, G]  (t2i)
 
 def dual_softmax(sim, tau=0.01):
-    # normalize over gallery AND query axes -> fights distractor hubness
+    # normalize over gallery AND query axes -> fights distractor hubness (FRAGILE cousin of DIS)
     a = F.softmax(sim / tau, dim=0)                       # over queries
     return sim * a
+
+def dynamic_inverted_softmax(sim, qb_sim=None, beta=20.0, gate=True):
+    """QB-Norm Dynamic Inverted Softmax (CVPR22): down-weight HUB gallery items by their popularity
+    across a querybank. Robust ('doesn't harm with suboptimal bank'). qb_sim default = the queries
+    themselves (label-free transductive); pass train-caption@gallery sims for the stricter version."""
+    qb = sim if qb_sim is None else qb_sim               # [B, G] bank->gallery
+    norm_g = torch.logsumexp(beta * qb, dim=0)           # [G] hub-ness of each gallery item
+    if gate:                                             # DYNAMIC: only penalise actual hubs
+        is_hub = torch.bincount(qb.argmax(1), minlength=qb.shape[1]) > 1
+        norm_g = norm_g * is_hub.float()
+    return beta * sim - norm_g.unsqueeze(0)              # [Q,G] log-scores (rank per query)
+
+def sinkhorn_norm(sim, beta=20.0, iters=5):
+    """Sinkhorn normalization (DBSN-style, log-domain): iterative row/col balancing to cut hubness.
+    NOTE: gallery>>queries is asymmetric -> doubly-stochastic is ill-posed; measure vs DIS."""
+    M = beta * sim
+    for _ in range(iters):
+        M = M - torch.logsumexp(M, dim=1, keepdim=True)  # over gallery
+        M = M - torch.logsumexp(M, dim=0, keepdim=True)  # over queries
+    return M
 
 def query_expansion(q_feat, g_feat, topk=5):
     s = q_feat @ g_feat.t()
@@ -288,11 +308,16 @@ def run_ablation(val_dir, n_distract=5000):
     base = sim_itc(qf, g_feat)
     results = {}
     results["ITC"]                = report("ITC (base)", base)
-    results["+dual_softmax"]      = report("+dual_softmax", dual_softmax(base))
+    # --- normalization family: pick the WINNER by number (DIS expected >= dual-softmax) ---
+    results["+dual_softmax"]      = report("+dual_softmax (fragile)", dual_softmax(base))
+    results["+DIS"]               = report("+DIS (QB-Norm)", dynamic_inverted_softmax(base))
+    results["+sinkhorn"]          = report("+sinkhorn", sinkhorn_norm(base))
+    # --- re-ID-origin tricks: expected setting-mismatch on single-GT; measure honestly ---
     try:
-        results["+k_reciprocal"]  = report("+k_reciprocal", k_reciprocal(qf, g_feat))
+        results["+k_reciprocal"]  = report("+k_reciprocal (re-ID)", k_reciprocal(qf, g_feat))
     except Exception as ex: print("  k_reciprocal skipped:", ex)
-    results["+ITM"]               = report("+ITM rerank", itm_rerank(base, g_emb, qe, qa))
+    # --- precision rerank on top of the BEST normalizer (DIS) ---
+    results["+DIS+ITM"]           = report("+DIS+ITM rerank", itm_rerank(dynamic_inverted_softmax(base), g_emb, qe, qa))
     # FLAG destructive
     b = results["ITC"]
     print("\n[anti-destructive] vs ITC baseline:")
@@ -307,9 +332,13 @@ def run_ablation(val_dir, n_distract=5000):
 
 
 # ============================== CELL 6 — final pipeline on MASKED set -> submission ==============================
-def build_final_score(keep_dual=True, keep_kr=False, keep_itm=True):
-    sim = sim_itc(Q_FEAT, G_FEAT)                          # [Q,G]
-    if keep_dual: sim = dual_softmax(sim)
+def build_final_score(norm="dis", keep_kr=False, keep_itm=True):
+    """norm: 'dis' (Dynamic Inverted Softmax, recommended) | 'sinkhorn' | 'dualsoftmax' | 'none'.
+    keep_kr: k-reciprocal (re-ID origin, setting-mismatch on single-GT PAB) -> OFF; gate by measuring."""
+    sim = sim_itc(Q_FEAT, G_FEAT)                          # [Q,G] cosine
+    if   norm == "dis":         sim = dynamic_inverted_softmax(sim)   # evidence-based recall lever
+    elif norm == "sinkhorn":    sim = sinkhorn_norm(sim)
+    elif norm == "dualsoftmax": sim = dual_softmax(sim)
     if keep_kr:
         try: sim = 0.5*_minmax(sim) + 0.5*_minmax(k_reciprocal(Q_FEAT, G_FEAT))
         except Exception as ex: print("kr skip:", ex)
@@ -515,7 +544,7 @@ if USE_TTA:
     print(">> TTA flip: re-encoding gallery ITC feature (averaged over horizontal flip).")
     G_FEAT = encode_gallery_tta(GAL_DIR, GAL_NAMES)
 
-SCORE = build_final_score(keep_dual=True, keep_kr=False, keep_itm=True)   # CMP ITC + dual-softmax + ITM rerank
+SCORE = build_final_score(norm="dis", keep_kr=False, keep_itm=True)   # CMP ITC + Dynamic-Inverted-Softmax + ITM rerank
 write_submission(SCORE, out=f"{WORK}/answer_cmp.txt")   # CMP baseline kept SEPARATELY (submit to compare vs Qwen)
 write_submission(SCORE)                  # answer.txt (Qwen overwrites this; failure-safe if Qwen dies/times out)
 save_candidates_for_lmm(SCORE)
