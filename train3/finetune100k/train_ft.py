@@ -93,14 +93,28 @@ def main():
                              {"params": head, "lr": cfg.get("lr_head", 2e-5)}], weight_decay=0.01)
     ema = EMA(model, cfg.get("ema", 0.999))
 
+    # AMP: bf16 on Ampere+ (A100); fp16+GradScaler on Kaggle T4/P100 (no usable bf16)
+    bf16 = torch.cuda.is_bf16_supported()
+    amp_dtype = torch.bfloat16 if bf16 else torch.float16
+    scaler = torch.cuda.amp.GradScaler(enabled=not bf16)
+    print("AMP:", "bf16" if bf16 else "fp16 + GradScaler (T4/P100)")
+
     epochs = cfg.get("epochs", 3); bs = cfg.get("batch_size", 32)
     steps_total = epochs * math.ceil(len(anns) / bs)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps_total)
     eval_every = cfg.get("eval_every", 500)
-    best = base_map; best_path = os.path.join(args.out, "checkpoint_best.pth"); step = 0
+    best = base_map; best_path = os.path.join(args.out, "checkpoint_best.pth")
+    last_path = os.path.join(args.out, "last.pth"); step = 0; start_ep = 0
+    # RESUME across Kaggle sessions (re-run the cell; needs out/ persisted, e.g. saved as notebook output)
+    if os.path.exists(last_path):
+        ck = torch.load(last_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"]); sched.load_state_dict(ck["sched"])
+        step, best, start_ep = ck["step"], ck["best"], ck["epoch"]
+        ema.shadow = {k: v.to(device) for k, v in ck["ema"].items()}
+        print(f"RESUMED {last_path}: step{step} best{best:.4f} epoch{start_ep}")
     t0 = time.time()
 
-    for ep in range(epochs):
+    for ep in range(start_ep, epochs):
         print(f"=== epoch {ep}: mining cross-ID hard negatives ===")
         mine_negatives.mine(model, anns, cfg["image_root"], pose_tf, tok, device, cfg["max_tokens"],
                             topk=cfg.get("mine_topk", 10))
@@ -117,7 +131,7 @@ def main():
             h_ids, h_atts = tk(b["hard_caption"]) if b["hard_i"] is not None else (None, None)
             m_ids, m_atts = tk(b["mined_caption"]) if b["mined_i"] is not None else (None, None)
             be_pose = cfg.get("be_pose_img", True)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast("cuda", dtype=amp_dtype):
                 litc, litm, lmlm, lanom = model(
                     b["image"].to(device), ti.input_ids, ti.attention_mask,
                     text_ids_masked=tim, masked_pos=mp, masked_ids=mi_, idx=b["idx"].to(device),
@@ -131,9 +145,9 @@ def main():
                     mined_i_pose=b["mined_pose"].to(device) if be_pose and b["mined_pose"] is not None else None,
                     mined_text_ids=m_ids, mined_text_atts=m_atts)
                 loss = litc + litm + lmlm + lanom
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            opt.step(); sched.step(); opt.zero_grad(); ema.update(model); step += 1
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            scaler.step(opt); scaler.update(); sched.step(); opt.zero_grad(); ema.update(model); step += 1
 
             if step % 50 == 0:
                 print(f"ep{ep} step{step}/{steps_total} loss {loss.item():.3f} "
@@ -147,6 +161,9 @@ def main():
                     best = m["mAP"]; ema.swap_in(model)
                     torch.save({"model": model.state_dict(), "config": cfg, "val": m}, best_path)
                     ema.swap_out(model)
+                # resume checkpoint (every eval) so a Kaggle session cutoff can continue
+                torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
+                            "ema": ema.shadow, "step": step, "best": best, "epoch": ep}, last_path)
 
     print(f"\n=== DONE in {(time.time()-t0)/60:.1f} min ===")
     print(f"baseline mAP {base_map:.4f} -> best mAP {best:.4f}  (delta {best-base_map:+.4f})")
