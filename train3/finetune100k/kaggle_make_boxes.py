@@ -6,23 +6,50 @@
 # Output feeds the box-grounding head later. Resumable. Kaggle GPU T4, Internet ON.
 # =====================================================================================
 
-# ============================== CELL 0 — setup + detect data ==============================
+# ============================== CELL 0 — setup + EXTRACT .tar.zst + detect data ==============================
 import os, sys, json, glob, time, subprocess
 import torch
 subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-                "transformers>=4.45", "spacy", "pillow"], check=False)
+                "transformers>=4.45", "spacy", "pillow", "zstandard"], check=False)
 subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"], check=False)
 WORK = "/kaggle/working"
 device = "cuda" if torch.cuda.is_available() else "cpu"
+EXT = f"{WORK}/ext"
+OUT = f"{WORK}/boxes_30k.jsonl"
 
-def _find(pat):
-    h = sorted(glob.glob(f"/kaggle/input/**/{pat}", recursive=True)); return h[0] if h else None
+# ---- extract the dataset archive (input is train_30k_hard_data.tar.zst, NOT unpacked) ----
+def _g1(pat):
+    h = sorted(glob.glob(pat, recursive=True)); return h[0] if h else None
+
+if not glob.glob(f"{EXT}/**/train_webp", recursive=True):
+    zst = _g1("/kaggle/input/**/*.tar.zst")
+    if zst:
+        print("extracting", zst, "(train_webp + subsets + annotation only) ...")
+        import zstandard, tarfile
+        os.makedirs(EXT, exist_ok=True)
+        keep = ("/train_webp/", "train_30k_hard.jsonl", "/subsets/", "/annotation/")
+        t0 = time.time()
+        with open(zst, "rb") as fh, zstandard.ZstdDecompressor().stream_reader(fh) as r:
+            with tarfile.open(fileobj=r, mode="r|") as tar:
+                for m in tar:
+                    if m.isfile() and any(k in m.name for k in keep):
+                        tar.extract(m, EXT)
+        print(f"extracted in {(time.time()-t0)/60:.1f} min")
+    else:
+        print("WARN: no .tar.zst found under /kaggle/input — check the dataset is added")
+
+def _find(pat):                                   # search the EXTRACTED tree (fallback raw input)
+    for root in (EXT, "/kaggle/input"):
+        h = sorted(glob.glob(f"{root}/**/{pat}", recursive=True))
+        if h: return h[0]
+    return None
 
 JSONL = _find("train_30k_hard.jsonl")
 WEBP_ROOT = None
-for c in glob.glob("/kaggle/input/**/train_webp", recursive=True):
-    if os.path.isdir(c): WEBP_ROOT = c; break
-OUT = f"{WORK}/boxes_30k.jsonl"
+for root in (EXT, "/kaggle/input"):
+    for c in glob.glob(f"{root}/**/train_webp", recursive=True):
+        if os.path.isdir(c): WEBP_ROOT = c; break
+    if WEBP_ROOT: break
 print("subset jsonl:", JSONL, "\ntrain_webp:", WEBP_ROOT, "\nout:", OUT)
 
 
@@ -107,3 +134,41 @@ with open(OUT, "a", encoding="utf-8") as f:
             print(f"{n} done | {rate:.1f} img/s | ETA {(len(_rows)-len(done)-n)/max(rate,1e-6)/3600:.1f}h")
 print(f"DONE {n} images in {(time.time()-t0)/60:.1f} min -> {OUT}")
 # boxes_30k.jsonl: {image_id, image, boxes:[{phrase, box[x1,y1,x2,y2], score}]}  -> upload as a dataset for the box head
+
+
+# ============================== CELL 3 — VISUALIZE ~50 images with boxes + caption nouns ==============================
+import math
+from PIL import Image, ImageDraw
+import matplotlib.pyplot as plt
+
+K = 50
+results = []
+if os.path.exists(OUT):                                  # use generated boxes
+    for l in open(OUT, encoding="utf-8"):
+        results.append(json.loads(l))
+        if len(results) >= K: break
+else:                                                    # not generated yet -> compute K live (preview)
+    for r in _rows[:K]:
+        p = img_path(r["image"])
+        if not os.path.exists(p): continue
+        img = Image.open(p).convert("RGB")
+        results.append({"image": r["image"], "boxes": ground(img, caption_phrases(r["caption"]))})
+
+COLORS = ["#FF3838", "#39FF14", "#00E5FF", "#FFD400", "#FF00FF", "#FF8C00", "#FFFFFF", "#7CFC00"]
+cols = 5
+rows = math.ceil(len(results) / cols)
+plt.figure(figsize=(cols * 3.4, rows * 3.6))
+for i, res in enumerate(results):
+    p = img_path(res["image"])
+    if not os.path.exists(p): continue
+    img = Image.open(p).convert("RGB"); dr = ImageDraw.Draw(img)
+    for j, b in enumerate(res["boxes"]):
+        x1, y1, x2, y2 = b["box"]; c = COLORS[j % len(COLORS)]
+        dr.rectangle([x1, y1, x2, y2], outline=c, width=2)
+        dr.text((x1 + 2, max(0, y1 + 1)), f'{b["phrase"]} {b["score"]:.2f}', fill=c)
+    ax = plt.subplot(rows, cols, i + 1); ax.imshow(img); ax.axis("off")
+    ax.set_title(" | ".join(b["phrase"] for b in res["boxes"][:4]) or "(no box)", fontsize=6)
+plt.tight_layout(); plt.savefig(f"{WORK}/viz_boxes.png", dpi=120, bbox_inches="tight")
+plt.show()
+print(f"saved {WORK}/viz_boxes.png  ({len(results)} images;  "
+      f"avg boxes/img = {sum(len(r['boxes']) for r in results)/max(len(results),1):.1f})")
