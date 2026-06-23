@@ -14,6 +14,8 @@ subprocess.run([sys.executable, "-m", "pip", "install", "-q",
 subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"], check=False)
 WORK = "/kaggle/working"
 device = "cuda" if torch.cuda.is_available() else "cpu"
+assert device == "cuda", ("GPU NOT enabled -> would run on CPU (~12s/img, ETA ~100h). "
+                          "Notebook Settings -> Accelerator -> GPU T4, then re-run.")
 EXT = f"{WORK}/ext"
 OUT = f"{WORK}/boxes_30k.jsonl"
 
@@ -92,11 +94,16 @@ def ground(image, phrases, box_thr=0.30, txt_thr=0.22):
     prompt = " . ".join(phrases) + " ."
     inp = proc(images=image, text=prompt, return_tensors="pt").to(device)
     out = gdino(**inp)
-    res = proc.post_process_grounded_object_detection(
-        out, inp.input_ids, box_threshold=box_thr, text_threshold=txt_thr,
-        target_sizes=[image.size[::-1]])[0]
+    tsz = [image.size[::-1]]
+    try:                                   # new transformers: threshold=
+        res = proc.post_process_grounded_object_detection(
+            out, inp.input_ids, threshold=box_thr, text_threshold=txt_thr, target_sizes=tsz)[0]
+    except TypeError:                      # older transformers: box_threshold=
+        res = proc.post_process_grounded_object_detection(
+            out, inp.input_ids, box_threshold=box_thr, text_threshold=txt_thr, target_sizes=tsz)[0]
+    labels = res.get("labels", res.get("text_labels", []))   # key renamed across versions
     boxes = []
-    for b, s, lab in zip(res["boxes"].tolist(), res["scores"].tolist(), res["labels"]):
+    for b, s, lab in zip(res["boxes"].tolist(), res["scores"].tolist(), labels):
         boxes.append({"phrase": lab, "box": [round(x, 1) for x in b], "score": round(float(s), 3)})
     return boxes
 
