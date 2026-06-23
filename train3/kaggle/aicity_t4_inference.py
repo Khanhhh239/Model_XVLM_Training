@@ -440,7 +440,7 @@ def extract_mask(cap):
     return " ".join(masked), gold
 
 mdl = Qwen2VLForConditionalGeneration.from_pretrained(MODEL, torch_dtype="auto", device_map="auto").eval()
-proc = AutoProcessor.from_pretrained(MODEL, min_pixels=64*28*28, max_pixels=160*28*28)  # cap image tokens for speed
+proc = AutoProcessor.from_pretrained(MODEL, min_pixels=64*28*28, max_pixels=128*28*28)  # cap image tokens for speed
 emb = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")                     # semantic word match
 
 def fill(img, masked):
@@ -450,7 +450,7 @@ def fill(img, masked):
              f"Sentence: {masked}"}]}]
     t = proc.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
     inp = proc(text=[t], images=[img], return_tensors="pt").to(mdl.device)
-    out = mdl.generate(**inp, max_new_tokens=24, do_sample=False)
+    out = mdl.generate(**inp, max_new_tokens=16, do_sample=False)
     return proc.batch_decode(out[:, inp.input_ids.shape[1]:], skip_special_tokens=True)[0]
 
 def match_score(preds, gold):
