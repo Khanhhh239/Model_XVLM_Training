@@ -23,9 +23,12 @@ class DataConfig:
     lhp_min_scale: float = 0.5
     lhp_use_bbox: bool = True
     # smart sampler
-    group_by: str = "scene"          # "scene" | "action" | "none"
+    group_by: str = "scene"          # "scene" | "action" | "pair" | "none"
     group_fraction: float = 0.5       # fraction of batch drawn from one group
     num_workers: int = 8
+    # STAGE 1: External data sources
+    vitpose_json: str | None = None   # Path to vitpose keypoints JSON
+    boxes_json: str | None = None     # Path to bounding boxes JSONL
 
 
 @dataclass
@@ -43,6 +46,9 @@ class ModelConfig:
     # pose branch (toggle) — fused into the IMAGE-encoder branch, no separate pose loss
     pose_enabled: bool = False
     pose_hidden: int = 256
+    # STAGE 1: New heads
+    bbox_enabled: bool = False        # Box grounding head (spatial understanding)
+    anomaly_enabled: bool = False     # Anomaly classification head (normal vs abnormal)
 
 
 @dataclass
@@ -51,6 +57,15 @@ class LossConfig:
     w_itc: float = 1.0                # ITC coefficient (fixed at 1.0 in the plan)
     lambda_itm: float = 1.0           # λ1 — ITC:ITM = 1:1 is the proven X-VLM/ALBEF ratio: keep
     lambda_smooth_ap: float = 0.3     # λ2 — the ONE real unknown: sweep {0, 0.1, 0.3, 1.0} on VAL-B
+    # STAGE 1: New losses
+    lambda_box: float = 0.1           # Box grounding loss weight
+    w_box_giou: float = 2.0           # GIoU weight within box loss
+    w_box_l1: float = 5.0             # L1 weight within box loss (ratio GIoU:L1 = 2:5)
+    lambda_anomaly: float = 0.2       # Anomaly classification loss weight
+    anomaly_rampup_steps: int = 500   # Gradually increase anomaly weight from 0 to full over N steps
+    # XBM Queue (Cross-Batch Memory for extra ITC negatives)
+    xbm_enabled: bool = False         # Enable XBM queue for ITC
+    xbm_size: int = 8192              # Queue capacity (8192 = ~27% of 30K dataset)
     # weighting scheme: "fixed" (default, recommended) | "uncertainty" (Kendall 1705.07115)
     # | "dwa" (Liu 1803.10704). Dynamic modes apply ON TOP of the base weights above (ablation).
     weighting: str = "fixed"

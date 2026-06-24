@@ -13,13 +13,15 @@ prior is kept and the scheme only adapts around it:
                 r_i = L_i(t-1) / L_i(t-2)                   (Liu, arXiv 1803.10704)
                 Slowly-descending losses get up-weighted. Stateful but not learnable;
                 the 2-step history is NOT checkpointed (resume restarts at equal weights).
+
+STAGE 1 UPDATE: Now supports 5 tasks (itc, itm, smap, box, anomaly) instead of 3.
 """
 from __future__ import annotations
 
 import torch
 from torch import Tensor, nn
 
-TASKS = ("itc", "itm", "smap")
+TASKS = ("itc", "itm", "smap", "box", "anomaly")
 
 
 class FixedWeighter(nn.Module):
@@ -28,7 +30,7 @@ class FixedWeighter(nn.Module):
         self.base = dict(base)
 
     def forward(self, losses: dict[str, Tensor]) -> Tensor:
-        return sum(self.base[k] * losses[k] for k in TASKS)
+        return sum(self.base.get(k, 0.0) * losses.get(k, torch.tensor(0.0, device=next(iter(losses.values())).device)) for k in TASKS)
 
 
 class UncertaintyWeighter(nn.Module):
@@ -40,9 +42,10 @@ class UncertaintyWeighter(nn.Module):
         self.log_var = nn.Parameter(torch.zeros(len(TASKS)))
 
     def forward(self, losses: dict[str, Tensor]) -> Tensor:
-        total = losses[TASKS[0]].new_zeros(())
+        total = torch.tensor(0.0, device=next(iter(losses.values())).device, dtype=torch.float32)
         for i, k in enumerate(TASKS):
-            total = total + torch.exp(-self.log_var[i]) * self.base[k] * losses[k] + self.log_var[i]
+            if k in losses:
+                total = total + torch.exp(-self.log_var[i]) * self.base.get(k, 0.0) * losses[k] + self.log_var[i]
         return total
 
     def weights(self) -> dict[str, float]:
@@ -63,16 +66,17 @@ class DWAWeighter(nn.Module):
     def forward(self, losses: dict[str, Tensor]) -> Tensor:
         if len(self._hist) >= 2:
             prev1, prev2 = self._hist[-1], self._hist[-2]
-            r = torch.tensor([prev1[k] / max(prev2[k], 1e-8) for k in TASKS])
+            r = torch.tensor([prev1.get(k, 1.0) / max(prev2.get(k, 1e-8), 1e-8) for k in TASKS])
             k_w = len(TASKS) * torch.softmax(r / self.temp, dim=0)
         else:
             k_w = torch.ones(len(TASKS))            # equal weights until history exists
         self.last_k = {k: round(float(k_w[i]), 4) for i, k in enumerate(TASKS)}
 
-        total = losses[TASKS[0]].new_zeros(())
+        total = torch.tensor(0.0, device=next(iter(losses.values())).device, dtype=torch.float32)
         for i, k in enumerate(TASKS):
-            total = total + float(k_w[i]) * self.base[k] * losses[k]
-        self._hist.append({k: float(losses[k].detach()) for k in TASKS})
+            if k in losses:
+                total = total + float(k_w[i]) * self.base.get(k, 0.0) * losses[k]
+        self._hist.append({k: float(losses[k].detach()) if k in losses else 0.0 for k in TASKS})
         self._hist = self._hist[-2:]
         return total
 
@@ -81,7 +85,13 @@ class DWAWeighter(nn.Module):
 
 
 def build_weighter(cfg_loss) -> nn.Module:
-    base = {"itc": cfg_loss.w_itc, "itm": cfg_loss.lambda_itm, "smap": cfg_loss.lambda_smooth_ap}
+    base = {
+        "itc": cfg_loss.w_itc,
+        "itm": cfg_loss.lambda_itm,
+        "smap": cfg_loss.lambda_smooth_ap,
+        "box": getattr(cfg_loss, "lambda_box", 0.0),
+        "anomaly": getattr(cfg_loss, "lambda_anomaly", 0.0),
+    }
     mode = cfg_loss.weighting
     if mode == "fixed":
         return FixedWeighter(base)

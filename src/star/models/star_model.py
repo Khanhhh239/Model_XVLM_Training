@@ -17,7 +17,9 @@ from torch import Tensor, nn
 
 from ..losses import ITCLoss, ITMLoss, SmoothAPLoss, build_itm_pairs
 from ..losses.weighting import build_weighter
+from ..losses.xbm_queue import XBMQueue
 from .backbone import build_backbone
+from .heads import AnomalyClassificationHead, BoxGroundingHead
 from .lora import count_trainable, mark_only_lora_trainable
 from .pose import PoseBranch
 
@@ -34,6 +36,13 @@ class STARModel(nn.Module):
         # pose branch fused into the image branch (toggle), no separate loss
         self.pose = PoseBranch(cfg.model.embed_dim, hidden=cfg.model.pose_hidden) if cfg.model.pose_enabled else None
 
+        # STAGE 1: New heads for box grounding + anomaly classification
+        self.bbox_head = BoxGroundingHead(cfg.model.embed_dim) if cfg.model.bbox_enabled else None
+        self.anomaly_head = AnomalyClassificationHead(cfg.model.embed_dim) if cfg.model.anomaly_enabled else None
+
+        # XBM Queue for ITC (provides extra negatives from past batches)
+        self.xbm_queue = XBMQueue(size=cfg.loss.xbm_size, dim=cfg.model.embed_dim) if cfg.loss.xbm_enabled else None
+
         # losses. Review fix #6: if the backbone exposes a pretrained `temp` (real X-VLM), reuse it
         # instead of creating a fresh one (the dummy backbone has none -> ITC owns its temp).
         self.itc = ITCLoss(temp_init=cfg.loss.itc_temp_init,
@@ -44,13 +53,30 @@ class STARModel(nn.Module):
         # multi-task weighting: fixed (default) | uncertainty | dwa  (analyze.md §14)
         self.weighter = build_weighter(cfg.loss)
 
-        # if real LoRA was injected, train only LoRA + task heads (image proj, ITM head, pose, temp).
-        # NOTE: txt_proj is intentionally absent -> text side stays frozen.
+        # CRITICAL FIX for STAGE 1: Freeze vision encoder 100%, train cross-attention + heads
+        # In STAGE 1 (lora_enabled=False): n_lora=0, but we MUST freeze vision encoder
+        # In STAGE 2 (lora_enabled=True): n_lora>0, LoRA on vision+cross, rest frozen
         if self.n_lora > 0:
+            # STAGE 2: LoRA enabled -> train only LoRA params + task heads
             mark_only_lora_trainable(
                 self, train_heads=("itm_head", "img_proj", "vision_proj", "pose", "temp", "gate",
-                                   "weighter"),
+                                   "weighter", "bbox_head", "anomaly_head"),
             )
+        else:
+            # STAGE 1: No LoRA -> freeze vision encoder + text encoder, train cross-attention + heads
+            # Strategy: Freeze all backbone.net params that are vision or text-related
+            for name, param in self.named_parameters():
+                # Freeze vision encoder (Swin-B or dummy patch/img_pos)
+                if "backbone.net.patch" in name or "backbone.net.img_pos" in name or "vision_encoder" in name:
+                    param.requires_grad_(False)
+                # Freeze text encoder + txt_proj (text side 100% frozen)
+                elif any(k in name for k in ("backbone.net.tok_embed", "backbone.net.txt_pos", 
+                                              "backbone.net.text_self", "backbone.net.txt_proj",
+                                              "text_encoder")):
+                    param.requires_grad_(False)
+                # Train cross-attention, img_proj, ITM head, new heads, pose, weighter, temp
+                else:
+                    param.requires_grad_(True)
 
     # ------------------------------------------------------------------ info
     def trainable_summary(self) -> str:
@@ -72,8 +98,15 @@ class STARModel(nn.Module):
         if inst is None:
             inst = torch.arange(n, device=device)
 
-        # ---- ITC (all_gather across GPUs, identity soft targets) ----
-        loss_itc = self.itc(img_feat, txt_feat, ids=inst)
+        # ---- ITC with XBM Queue (extra negatives from past batches) ----
+        queue_img, queue_txt = None, None
+        if self.xbm_queue is not None:
+            queue_img, queue_txt = self.xbm_queue.get_queue()
+        loss_itc = self.itc(img_feat, txt_feat, ids=inst, queue_img=queue_img, queue_txt=queue_txt)
+        
+        # Update XBM queue AFTER computing loss (detached features)
+        if self.xbm_queue is not None:
+            self.xbm_queue.enqueue(img_feat.detach(), txt_feat.detach())
 
         # ---- Smooth-AP (relevance = same-instance) ----
         relevance = (inst[:, None] == inst[None, :]).float()
@@ -92,8 +125,42 @@ class STARModel(nn.Module):
         )
         loss_itm = self.itm(itm_logits, pairs["label"])
 
-        # ---- total: weighter combines the tasks (fixed: w_itc*ITC + λ1*ITM + λ2*SmoothAP) ----
-        total = self.weighter({"itc": loss_itc, "itm": loss_itm, "smap": loss_smap})
+        # ---- STAGE 1: Box Grounding Loss (only for rows with bbox) ----
+        loss_box = torch.tensor(0.0, device=device)
+        if self.bbox_head is not None and "bbox" in batch:
+            bbox_pred = self.bbox_head(img_feat)
+            bbox_gt = batch["bbox"]
+            bbox_mask = batch.get("bbox_mask")  # [B] binary mask (1=valid, 0=skip)
+            loss_box = BoxGroundingHead.compute_loss(
+                bbox_pred, bbox_gt, mask=bbox_mask,
+                w_giou=self.cfg.loss.w_box_giou,
+                w_l1=self.cfg.loss.w_box_l1,
+            )
+
+        # ---- STAGE 1: Anomaly Classification Loss ----
+        loss_anomaly = torch.tensor(0.0, device=device)
+        if self.anomaly_head is not None and "anomaly_label" in batch:
+            anomaly_logits = self.anomaly_head(img_feat)
+            anomaly_labels = batch["anomaly_label"]  # [B] 0=normal, 1=anomaly
+            anomaly_mask = batch.get("anomaly_mask")  # [B] binary mask (1=valid, 0=skip)
+            loss_anomaly = AnomalyClassificationHead.compute_loss(
+                anomaly_logits, anomaly_labels, mask=anomaly_mask
+            )
+            # Ramp-up: gradually increase weight from 0 to full over first N steps
+            if self.cfg.loss.anomaly_rampup_steps > 0:
+                rampup_factor = min(1.0, step / self.cfg.loss.anomaly_rampup_steps)
+                loss_anomaly = loss_anomaly * rampup_factor
+
+        # ---- total: weighter combines the tasks ----
+        losses = {
+            "itc": loss_itc,
+            "itm": loss_itm,
+            "smap": loss_smap,
+            "box": loss_box,
+            "anomaly": loss_anomaly,
+        }
+        total = self.weighter(losses)
+        
         # components are returned NON-detached so the trainer's per-loss grad-norm diagnostic
         # (train.grad_norm_every) can backprop through them; harmless for logging (.item()).
         return {
@@ -101,6 +168,8 @@ class STARModel(nn.Module):
             "loss_itc": loss_itc,
             "loss_itm": loss_itm,
             "loss_smap": loss_smap,
+            "loss_box": loss_box,
+            "loss_anomaly": loss_anomaly,
         }
 
     @torch.no_grad()

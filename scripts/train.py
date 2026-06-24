@@ -52,16 +52,20 @@ def main():
                  f"(best_metric was {msg.get('best_metric')}) -> fresh optimizer/scheduler/step")
     tokenizer = model.backbone.tokenizer
 
-    train_ds = PABDataset(
-        cfg.data.manifest, cfg.data.image_root, tokenizer, split="train",
-        image_size=cfg.data.image_size, max_token=cfg.data.max_token, train=True,
-        lhp_kwargs={"min_scale": cfg.data.lhp_min_scale, "use_bbox": cfg.data.lhp_use_bbox,
-                    "enabled": cfg.data.lhp_enabled},
-    )
-    val_ds = PABDataset(
-        cfg.data.manifest, cfg.data.image_root, tokenizer, split="valb",
-        image_size=cfg.data.image_size, max_token=cfg.data.max_token, train=False,
-    )
+        train_ds = PABDataset(
+            cfg.data.manifest, cfg.data.image_root, tokenizer, split="train",
+            image_size=cfg.data.image_size, max_token=cfg.data.max_token, train=True,
+            lhp_kwargs={"min_scale": cfg.data.lhp_min_scale, "use_bbox": cfg.data.lhp_use_bbox,
+                        "enabled": cfg.data.lhp_enabled},
+            vitpose_json=getattr(cfg.data, "vitpose_json", None),
+            boxes_json=getattr(cfg.data, "boxes_json", None),
+        )
+        val_ds = PABDataset(
+            cfg.data.manifest, cfg.data.image_root, tokenizer, split="valb",
+            image_size=cfg.data.image_size, max_token=cfg.data.max_token, train=False,
+            vitpose_json=getattr(cfg.data, "vitpose_json", None),
+            boxes_json=getattr(cfg.data, "boxes_json", None),
+        )
 
     if cfg.data.group_by == "pair":
         pairs, groups = train_ds.pairs()

@@ -33,21 +33,23 @@ def _batch(b=4, L=16):
 def test_forward_returns_plan_losses():
     model = STARModel(_tiny_cfg())
     out = model(_batch(), step=1)
-    assert set(out) == {"loss", "loss_itc", "loss_itm", "loss_smap"}   # no loss_mlm
+    # STAGE 1: Now includes box and anomaly losses (0 if heads disabled by default)
+    assert set(out) == {"loss", "loss_itc", "loss_itm", "loss_smap", "loss_box", "loss_anomaly"}
     for v in out.values():
         assert torch.isfinite(torch.as_tensor(v))
 
 
 def test_text_tower_is_frozen():
     model = STARModel(_tiny_cfg())
-    text_keys = ("tok_embed", "txt_pos", "text_self", "txt_proj")
+    text_keys = ("tok_embed", "txt_pos", "text_self", "txt_proj", "text_encoder")
     frozen = [n for n, p in model.named_parameters()
               if any(k in n for k in text_keys)]
     assert frozen, "expected to find text-tower params"
     assert all(not p.requires_grad for n, p in model.named_parameters()
                if any(k in n for k in text_keys)), "text tower must be frozen"
-    # image side must still be trainable
-    assert any(p.requires_grad for n, p in model.named_parameters() if "patch" in n or "img_proj" in n)
+    # Cross-attention and heads must still be trainable (STAGE 1 strategy)
+    assert any(p.requires_grad for n, p in model.named_parameters() 
+               if "cross" in n or "itm_head" in n or "img_proj" in n)
 
 
 def test_pose_fused_at_eval_when_enabled():

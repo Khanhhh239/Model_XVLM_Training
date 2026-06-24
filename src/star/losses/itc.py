@@ -71,11 +71,20 @@ class ITCLoss(nn.Module):
     def temp(self) -> Tensor:
         return self._ext[0] if self._ext is not None else self.temp_param
 
-    def forward(self, img_feat: Tensor, txt_feat: Tensor, ids: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        img_feat: Tensor,
+        txt_feat: Tensor,
+        ids: Tensor | None = None,
+        queue_img: Tensor | None = None,
+        queue_txt: Tensor | None = None,
+    ) -> Tensor:
         """
         Args:
             img_feat, txt_feat: [N, d] (re-normalized here to be safe).
             ids: [N] identity (sequence_id) per pair; default = globally-unique arange.
+            queue_img: [Q, d] XBM queue image features (optional, for extra negatives).
+            queue_txt: [Q, d] XBM queue text features (optional, for extra negatives).
         """
         with torch.no_grad():
             self.temp.clamp_(0.001, 0.5)
@@ -90,10 +99,27 @@ class ITCLoss(nn.Module):
         txt = _gather(F.normalize(txt_feat, dim=-1))
         ids = _gather_nograd(ids)
 
-        sim_i2t = img @ txt.t() / self.temp        # [Nall, Nall]
-        sim_t2i = txt @ img.t() / self.temp
+        # Compute similarity: in-batch + queue negatives
+        sim_i2t_batch = img @ txt.t() / self.temp        # [Nall, Nall]
+        sim_t2i_batch = txt @ img.t() / self.temp
+        
+        # Add queue negatives if provided
+        if queue_img is not None and queue_txt is not None and queue_img.size(0) > 0:
+            # Queue features are already L2-normalized and detached
+            sim_i2t_queue = (img @ queue_txt.t()) / self.temp  # [Nall, Q]
+            sim_t2i_queue = (txt @ queue_img.t()) / self.temp  # [Nall, Q]
+            sim_i2t = torch.cat([sim_i2t_batch, sim_i2t_queue], dim=1)  # [Nall, Nall+Q]
+            sim_t2i = torch.cat([sim_t2i_batch, sim_t2i_queue], dim=1)
+        else:
+            sim_i2t = sim_i2t_batch
+            sim_t2i = sim_t2i_batch
 
-        pos = (ids[:, None] == ids[None, :]).float()
+        # Identity soft targets (only for in-batch pairs; queue is always negative)
+        pos = (ids[:, None] == ids[None, :]).float()  # [Nall, Nall]
+        if queue_img is not None and queue_img.size(0) > 0:
+            # Pad with zeros for queue columns (queue samples are negatives)
+            queue_size = queue_img.size(0)
+            pos = torch.cat([pos, torch.zeros(pos.size(0), queue_size, device=device)], dim=1)
         targets = pos / pos.sum(dim=1, keepdim=True).clamp_min(1.0)
 
         loss_i2t = -(F.log_softmax(sim_i2t, dim=1) * targets).sum(dim=1).mean()

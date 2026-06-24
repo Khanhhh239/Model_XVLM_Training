@@ -1,0 +1,98 @@
+# STAGE 1: Kaggle T4 Config for 30K Hard Subset Training
+# 
+# Strategy: Warm-start from best.pth (mAP 80%), FREEZE vision encoder, train only:
+#   - BERT Cross-Attention [6:12] (full finetune)
+#   - ITM head + projection heads
+#   - NEW: Box grounding head
+#   - NEW: Anomaly classification head  
+#   - NEW: Pose block
+#   - XBM Queue (8192 embeddings for strong ITC)
+#
+# Goal: Mài precision từ 80% → 82-86% mà KHÔNG tụt recall
+# Safety: Revert nếu mAP < 80%
+
+data:
+  manifest: data/train_30k_hard.jsonl  # ← Adjust path to your data location
+  image_root: data/train_webp/
+  vitpose_json: data/train_30k_hard_vitpose.json  # Pose keypoints
+  boxes_json: data/boxes_30k.jsonl                # Bounding boxes (STAGE 1)
+  image_size: 384                      # Higher than CMP baseline (224) for detail
+  max_token: 100
+  lhp_enabled: false                   # Use strong augmentation instead
+  group_by: pair                       # PairBatchSampler (anchor+hard same video)
+  group_fraction: 0.5
+  num_workers: 2                       # Kaggle ~4 vCPU
+
+model:
+  backbone: xvlm
+  checkpoint: data/checkpoints/best.pth  # ← WARM-START from mAP 80%!
+  embed_dim: 256
+  
+  # LoRA: STAGE 1 does NOT use LoRA (directly freeze/finetune for clarity)
+  lora_enabled: false
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_targets: [query, value]
+  lora_freeze_text: true               # Text encoder ALWAYS frozen
+  
+  # Pose branch (fused into image features)
+  pose_enabled: true
+  pose_hidden: 256
+  
+  # STAGE 1: New heads
+  bbox_enabled: true                   # Box grounding head
+  anomaly_enabled: true                # Anomaly classification head
+
+loss:
+  # Base losses (proven X-VLM weights)
+  w_itc: 1.0
+  lambda_itm: 1.0                      # ITM is MAIN loss for precision
+  lambda_smooth_ap: 0.2                # Lower than default (focus on ITM)
+  
+  # STAGE 1: New losses
+  lambda_box: 0.1                      # Box grounding (GIoU + L1)
+  w_box_giou: 2.0                      # Ratio GIoU:L1 = 2:5
+  w_box_l1: 5.0
+  lambda_anomaly: 0.2                  # Anomaly classification
+  anomaly_rampup_steps: 500            # Ramp up from 0 over first 500 steps
+  
+  # XBM Queue (extra negatives for ITC)
+  xbm_enabled: true
+  xbm_size: 8192                       # 8K embeddings (~27% of 30K dataset)
+  
+  weighting: fixed                     # Proven scheme
+  dwa_temp: 2.0
+  itc_temp_init: 0.07
+  smooth_ap_temp: 0.01
+
+optim:
+  # Differential LR strategy:
+  # - Old heads (cross-attn, itm_head, proj): LOW LR to keep recall 80%
+  # - New heads (box, anomaly, pose): HIGH LR to learn fast
+  lr_lora: 1.5e-5                      # Used for old heads (no LoRA, but reusing param)
+  lr_head: 1.0e-4                      # Used for new heads
+  
+  weight_decay: 0.02
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  grad_clip: 5.0                       # Higher clip for stable training
+  warmup_epochs: 0.5                   # Short warmup (already warm-started)
+  epochs: 8                            # Early stop usually at 2-3 epochs
+
+train:
+  batch_size: 16                       # T4 16GB, fallback to 12 or 8 if OOM
+  grad_accum: 1                        # No accumulation (XBM queue provides negatives)
+  amp_dtype: fp16                      # T4 does NOT support bf16
+  grad_checkpointing: true             # Essential for fitting in 16GB
+  eval_every_epochs: 0.5               # Eval twice per epoch
+  early_stop_patience: 1               # STRICT: Stop if mAP drops once
+  grad_norm_every: 200                 # Log grad norms every 200 steps (balance diagnostic)
+  seed: 42
+  out_dir: outputs/stage1_30k_t4
+  log_wandb: false                     # Set true if you want W&B logging
+
+# NOTE: Dataset needs external files:
+#   - train_30k_hard_vitpose.json (keypoints)
+#   - boxes_30k.jsonl (bounding boxes)
+# Paths are relative to data.image_root or can be absolute
