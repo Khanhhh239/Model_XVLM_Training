@@ -18,7 +18,7 @@ data:
   boxes_json: data/boxes_30k.jsonl                # Bounding boxes (STAGE 1)
   image_size: 384                      # Higher than CMP baseline (224) for detail
   max_token: 100
-  lhp_enabled: false                   # Use strong augmentation instead
+  lhp_enabled: true                    # LHP + strong Sim2Real aug (blur/JPEG/downscale)
   group_by: pair                       # PairBatchSampler (anchor+hard same video)
   group_fraction: 0.5
   num_workers: 2                       # Kaggle ~4 vCPU

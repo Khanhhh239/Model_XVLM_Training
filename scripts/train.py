@@ -52,20 +52,20 @@ def main():
                  f"(best_metric was {msg.get('best_metric')}) -> fresh optimizer/scheduler/step")
     tokenizer = model.backbone.tokenizer
 
-        train_ds = PABDataset(
-            cfg.data.manifest, cfg.data.image_root, tokenizer, split="train",
-            image_size=cfg.data.image_size, max_token=cfg.data.max_token, train=True,
-            lhp_kwargs={"min_scale": cfg.data.lhp_min_scale, "use_bbox": cfg.data.lhp_use_bbox,
-                        "enabled": cfg.data.lhp_enabled},
-            vitpose_json=getattr(cfg.data, "vitpose_json", None),
-            boxes_json=getattr(cfg.data, "boxes_json", None),
-        )
-        val_ds = PABDataset(
-            cfg.data.manifest, cfg.data.image_root, tokenizer, split="valb",
-            image_size=cfg.data.image_size, max_token=cfg.data.max_token, train=False,
-            vitpose_json=getattr(cfg.data, "vitpose_json", None),
-            boxes_json=getattr(cfg.data, "boxes_json", None),
-        )
+    train_ds = PABDataset(
+        cfg.data.manifest, cfg.data.image_root, tokenizer, split="train",
+        image_size=cfg.data.image_size, max_token=cfg.data.max_token, train=True,
+        lhp_kwargs={"min_scale": cfg.data.lhp_min_scale, "use_bbox": cfg.data.lhp_use_bbox,
+                    "enabled": cfg.data.lhp_enabled},
+        vitpose_json=getattr(cfg.data, "vitpose_json", None),
+        boxes_json=getattr(cfg.data, "boxes_json", None),
+    )
+    val_ds = PABDataset(
+        cfg.data.manifest, cfg.data.image_root, tokenizer, split="valb",
+        image_size=cfg.data.image_size, max_token=cfg.data.max_token, train=False,
+        vitpose_json=getattr(cfg.data, "vitpose_json", None),
+        boxes_json=getattr(cfg.data, "boxes_json", None),
+    )
 
     if cfg.data.group_by == "pair":
         pairs, groups = train_ds.pairs()
@@ -87,6 +87,17 @@ def main():
                                   pin_memory=True, drop_last=True)
 
     trainer = Trainer(model, cfg, train_loader, val_ds, device)
+
+    # STAGE 1.5: per-epoch ANCE cross-ID re-mining + hard_edges swap-pairs (needs PairBatchSampler)
+    if getattr(cfg.data, "remine_each_epoch", False):
+        assert cfg.data.group_by == "pair", "remine_each_epoch requires data.group_by=pair"
+        from star.data.mining import load_hard_edges  # noqa: E402
+        id2idx = {str(iid): i for i, iid in enumerate(train_ds.df["image_id"])}
+        edges = load_hard_edges(getattr(cfg.data, "hard_edges_json", None), id2idx)
+        trainer.setup_remining(train_ds, collate_fn, pairs, groups, edges,
+                               train_ds.df["video_id"].tolist())
+        log.info(f"[remine] ON: {len(edges)} hard_edges pairs, mine_fraction={cfg.data.mine_fraction}")
+
     if args.max_hours:
         trainer.max_seconds = args.max_hours * 3600
     if args.overfit_one_batch:

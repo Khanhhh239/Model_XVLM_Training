@@ -21,7 +21,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-TASKS = ("itc", "itm", "smap", "box", "anomaly")
+TASKS = ("itc", "itm", "smap", "box", "anomaly", "action")
 
 
 class FixedWeighter(nn.Module):
@@ -91,6 +91,7 @@ def build_weighter(cfg_loss) -> nn.Module:
         "smap": cfg_loss.lambda_smooth_ap,
         "box": getattr(cfg_loss, "lambda_box", 0.0),
         "anomaly": getattr(cfg_loss, "lambda_anomaly", 0.0),
+        "action": getattr(cfg_loss, "lambda_action", 0.0),
     }
     mode = cfg_loss.weighting
     if mode == "fixed":

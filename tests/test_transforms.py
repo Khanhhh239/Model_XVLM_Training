@@ -18,14 +18,14 @@ def test_eval_transform_shape():
 
 def test_lhp_global_branch_shape():
     t = LHPTransform(size=384, enabled=True)
-    out = t(_img(), bbox=None)
-    assert out.shape == (3, 384, 384)
+    img, _bbox, _kpts = t(_img(), bbox=None)        # __call__ returns (image, bbox, keypoints)
+    assert img.shape == (3, 384, 384)
 
 
 def test_lhp_local_bbox_branch_shape():
     t = LHPTransform(size=256, enabled=True, use_bbox=True)
-    out = t(_img(), bbox=[0.3, 0.3, 0.4, 0.4])
-    assert out.shape == (3, 256, 256)
+    img, _bbox, _kpts = t(_img(), bbox=[150.0, 120.0, 300.0, 320.0])   # pixel xyxy
+    assert img.shape == (3, 256, 256)
 
 
 def test_lora_starts_as_identity_then_merges():

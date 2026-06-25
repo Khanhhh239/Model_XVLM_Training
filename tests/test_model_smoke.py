@@ -33,8 +33,9 @@ def _batch(b=4, L=16):
 def test_forward_returns_plan_losses():
     model = STARModel(_tiny_cfg())
     out = model(_batch(), step=1)
-    # STAGE 1: Now includes box and anomaly losses (0 if heads disabled by default)
-    assert set(out) == {"loss", "loss_itc", "loss_itm", "loss_smap", "loss_box", "loss_anomaly"}
+    # STAGE 1.5: also includes box, anomaly, and action losses (0 if disabled by default)
+    assert set(out) == {"loss", "loss_itc", "loss_itm", "loss_smap",
+                        "loss_box", "loss_anomaly", "loss_action"}
     for v in out.values():
         assert torch.isfinite(torch.as_tensor(v))
 

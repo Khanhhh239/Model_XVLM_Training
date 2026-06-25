@@ -29,6 +29,11 @@ class DataConfig:
     # STAGE 1: External data sources
     vitpose_json: str | None = None   # Path to vitpose keypoints JSON
     boxes_json: str | None = None     # Path to bounding boxes JSONL
+    # STAGE 1.5: ANCE re-mining + swap-pair (group B). The trainer re-mines cross-ID hard pairs each
+    # epoch and blends them with the same-video pairs + hard_edges into the PairBatchSampler pool.
+    remine_each_epoch: bool = False   # re-mine cross-ID hard negatives before each epoch
+    mine_fraction: float = 0.5        # fraction of pairs that are mined cross-ID (rest = same-video)
+    hard_edges_json: str | None = None  # hard_edges_30k_hard.jsonl (same-video/diff-action swap pairs)
 
 
 @dataclass
@@ -63,6 +68,9 @@ class LossConfig:
     w_box_l1: float = 5.0             # L1 weight within box loss (ratio GIoU:L1 = 2:5)
     lambda_anomaly: float = 0.2       # Anomaly classification loss weight
     anomaly_rampup_steps: int = 500   # Gradually increase anomaly weight from 0 to full over N steps
+    # Action-keyword alignment (group C: action/pose mismatch). 0 = off.
+    lambda_action: float = 0.0        # image <-> action-phrase contrastive weight
+    action_temp: float = 0.07         # softmax temperature for the action loss
     # XBM Queue (Cross-Batch Memory for extra ITC negatives)
     xbm_enabled: bool = False         # Enable XBM queue for ITC
     xbm_size: int = 8192              # Queue capacity (8192 = ~27% of 30K dataset)

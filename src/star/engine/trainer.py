@@ -65,6 +65,71 @@ class Trainer:
     def _to_device(self, batch: dict) -> dict:
         return {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
+    # ------------------------------------------------------------------ ANCE re-mining (stage-1.5)
+    def setup_remining(self, train_ds, collate_fn, base_pairs, base_groups, edge_pairs, video_of_index):
+        """Enable per-epoch cross-ID re-mining. train.py supplies the same-video base pairs, the
+        hard_edges pairs, and the per-row video id; each epoch the trainer re-mines the hardest
+        cross-video confuser with the CURRENT model and rebuilds the PairBatchSampler pool."""
+        self.train_ds = train_ds
+        self.collate = collate_fn
+        self._base_pairs = list(base_pairs)
+        self._base_groups = list(base_groups)
+        self._edge_pairs = list(edge_pairs)
+        self._video_of_index = list(video_of_index)
+        self._video_tensor = torch.as_tensor(video_of_index)
+        self._remine_enabled = True
+
+    @torch.no_grad()
+    def _encode_train_features(self):
+        """Encode every TRAIN row (clean eval transform, pose fused) with the current model."""
+        from torch.utils.data import DataLoader
+
+        from ..data.transforms import build_eval_transform
+        ds = self.train_ds
+        saved_tf, saved_train = ds.transform, ds.train
+        ds.transform, ds.train = build_eval_transform(ds.image_size), False   # clean features
+        try:
+            loader = DataLoader(ds, batch_size=self.cfg.train.batch_size, shuffle=False,
+                                num_workers=self.cfg.data.num_workers, collate_fn=self.collate,
+                                pin_memory=True)
+            self.model.eval()
+            imgs, txts = [], []
+            for batch in loader:
+                batch = self._to_device(batch)
+                with torch.autocast(device_type=self.device_type, dtype=self.amp_dtype,
+                                    enabled=self.amp_dtype != torch.float32):
+                    img_f, txt_f = self.model.encode_for_eval(
+                        batch["image"], batch["input_ids"], batch["attention_mask"],
+                        keypoints=batch.get("keypoints"))
+                imgs.append(img_f.float())
+                txts.append(txt_f.float())
+        finally:
+            ds.transform, ds.train = saved_tf, saved_train
+            self.model.train()
+        return torch.cat(imgs), torch.cat(txts)
+
+    def _remine(self, epoch: int) -> None:
+        import random as _random
+        from torch.utils.data import DataLoader
+
+        from ..data import PairBatchSampler
+        from ..data.mining import build_pair_pool, mine_cross_id_pairs
+        t = time.time()
+        img_f, txt_f = self._encode_train_features()
+        picked = mine_cross_id_pairs(img_f, txt_f, self._video_tensor.to(img_f.device))
+        mined = [(i, int(picked[i])) for i in range(picked.size(0))]
+        pairs, groups = build_pair_pool(
+            self._base_pairs, self._edge_pairs, mined, self._video_of_index,
+            mine_fraction=self.cfg.data.mine_fraction,
+            rng=_random.Random(self.cfg.train.seed + epoch))
+        sampler = PairBatchSampler(pairs, groups, self.cfg.train.batch_size,
+                                   seed=self.cfg.train.seed + epoch)
+        self.train_loader = DataLoader(self.train_ds, batch_sampler=sampler,
+                                       num_workers=self.cfg.data.num_workers,
+                                       collate_fn=self.collate, pin_memory=True)
+        log.info(f"[remine] e{epoch}: {len(self._base_pairs)} base + {len(self._edge_pairs)} edges "
+                 f"+ {len(mined)} mined -> {len(pairs)} pairs ({(time.time() - t) / 60:.1f} min)")
+
     def _forward_loss(self, batch: dict):
         with torch.autocast(device_type=self.device_type, dtype=self.amp_dtype,
                             enabled=self.amp_dtype != torch.float32):
@@ -119,6 +184,8 @@ class Trainer:
         accum = self.cfg.train.grad_accum
         t0 = time.time()
         for epoch in range(self.start_epoch, self.cfg.optim.epochs):
+            if getattr(self, "_remine_enabled", False):
+                self._remine(epoch)               # re-mine cross-ID pairs with the current model
             self.model.train()
             self.optimizer.zero_grad(set_to_none=True)
             for it, batch in enumerate(self.train_loader):

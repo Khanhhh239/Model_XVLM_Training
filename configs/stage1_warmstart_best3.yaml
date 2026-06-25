@@ -1,0 +1,78 @@
+# STAGE 1.5 — warm-start from best (3).pth (STARModel, mAP 0.8024 / R@1 0.70 / R@10 0.977 on the
+# oldtest distractor VAL-B) and SHARPEN rank-1. best (3).pth already nails R@10 (GT almost always in
+# the top-10) but mis-orders rank-1 -> the levers below all target rank-1:
+#   + box-grounding head (#3 spatial)      + anomaly head (#1/#2 normal-vs-anomaly)
+#   + action-keyword loss (#C action)      + XBM queue (stronger contrastive on the T4 batch)
+#   + per-epoch ANCE cross-ID re-mine + hard_edges swap-pairs (#B identity/scene swap)
+# Run:  python scripts/train.py --config configs/stage1_warmstart_best3.yaml --init-from <best(3).pth>
+# (The notebook fills the Kaggle paths; --init-from loads the STARModel weights on top of the base.)
+
+data:
+  manifest: /kaggle/working/manifest_30k_hard_enhanced.parquet   # built by the notebook (build_stage1_manifest)
+  image_root: /kaggle/input/aicity-30k-hard-enhanced/data/train_webp
+  image_size: 384                 # best (3).pth native res (do NOT change -> reproduces 0.80)
+  max_token: 100
+  lhp_enabled: true               # LHP + sim2real aug (blur/JPEG/downscale/brightness) already in transforms.py
+  lhp_min_scale: 0.5
+  lhp_use_bbox: true
+  group_by: pair                  # PairBatchSampler: anchor + its hard partner in-batch every step
+  group_fraction: 0.5
+  num_workers: 2                  # Kaggle ~4 vCPU
+  vitpose_json: /kaggle/input/aicity-30k-hard-enhanced/data/subsets/prepared/train_30k_hard_vitpose.json
+  boxes_json: null                # box GT comes free from vitpose primary_bbox; set a jsonl to override
+  # STAGE 1.5 re-mining + swap-pairs
+  remine_each_epoch: true         # re-mine cross-ID hard negatives with the current model each epoch
+  mine_fraction: 0.5              # half the pair pool = mined cross-ID, rest = same-video (+ hard_edges)
+  hard_edges_json: /kaggle/input/aicity-30k-hard-enhanced/data/subsets/hard_edges_30k_hard.jsonl
+
+model:
+  backbone: xvlm
+  checkpoint: /kaggle/input/ckpt-30k-hard/xvlm_16m_base.th   # BASE for XVLMBackbone; best(3).pth refines via --init-from
+  embed_dim: 256                  # best (3).pth proj dim (256) — must match the checkpoint
+  lora_enabled: true              # LoRA on Swin qkv (image) + BERT fusion query/value (cross); text frozen
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_targets: [query, value]
+  lora_freeze_text: true
+  pose_enabled: true              # keypoint-MLP PoseBranch (already trained in best (3).pth)
+  pose_hidden: 256
+  bbox_enabled: true              # NEW head (fresh) — spatial grounding
+  anomaly_enabled: true           # NEW head (fresh) — normal vs anomaly (Ca/Cn)
+
+loss:
+  w_itc: 1.0
+  lambda_itm: 2.0                 # best (3).pth used 2.0 — ITM is the main rank-1 lever
+  lambda_smooth_ap: 0.2
+  lambda_box: 0.1                 # GIoU:L1 = 2:5
+  w_box_giou: 2.0
+  w_box_l1: 5.0
+  lambda_anomaly: 0.2
+  anomaly_rampup_steps: 500
+  lambda_action: 0.2             # NEW — image <-> action-phrase alignment (#C)
+  action_temp: 0.07
+  xbm_enabled: true              # NEW — extra ITC negatives on the small T4 batch
+  xbm_size: 8192
+  weighting: fixed
+  itc_temp_init: 0.07
+  smooth_ap_temp: 0.01
+
+optim:
+  lr_lora: 1.5e-5                # LOW — preserve the 0.80 warm-start while adapting
+  lr_head: 1.0e-4               # higher for the fresh box/anomaly heads + pose + proj
+  weight_decay: 0.02
+  betas: [0.9, 0.999]
+  grad_clip: 5.0
+  warmup_epochs: 0.5
+  epochs: 6                      # early-stop usually fires at 2-3
+
+train:
+  batch_size: 12                # T4 16GB @384 (fallback 8 if OOM); even (PairBatchSampler)
+  grad_accum: 2                 # effective 24
+  amp_dtype: fp16               # T4 has no bf16
+  grad_checkpointing: true
+  eval_every_epochs: 0.5
+  early_stop_patience: 2
+  grad_norm_every: 0
+  seed: 42
+  out_dir: /kaggle/working/out_stage1_best3

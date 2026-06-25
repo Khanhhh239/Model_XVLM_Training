@@ -15,7 +15,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-from ..losses import ITCLoss, ITMLoss, SmoothAPLoss, build_itm_pairs
+from ..losses import ITCLoss, ITMLoss, SmoothAPLoss, action_alignment_loss, build_itm_pairs
 from ..losses.weighting import build_weighter
 from ..losses.xbm_queue import XBMQueue
 from .backbone import build_backbone
@@ -151,6 +151,20 @@ class STARModel(nn.Module):
                 rampup_factor = min(1.0, step / self.cfg.loss.anomaly_rampup_steps)
                 loss_anomaly = loss_anomaly * rampup_factor
 
+        # ---- Action-keyword alignment (group C: action/pose mismatch) ----
+        # Align the (pose-fused) image feature with its action-phrase embedding; mask out the
+        # hard-partner rows (action="hard_pair") which carry no real action label.
+        loss_action = torch.tensor(0.0, device=device)
+        if (self.cfg.loss.lambda_action > 0 and "action_input_ids" in batch
+                and batch.get("action_valid") is not None):
+            vmask = batch["action_valid"].bool()
+            if int(vmask.sum()) >= 2:
+                _, act_feat = self.backbone.encode_text(
+                    batch["action_input_ids"], batch["action_attention_mask"])
+                loss_action = action_alignment_loss(
+                    img_feat[vmask], act_feat[vmask], batch["action_group"][vmask],
+                    temp=self.cfg.loss.action_temp)
+
         # ---- total: weighter combines the tasks ----
         losses = {
             "itc": loss_itc,
@@ -158,9 +172,10 @@ class STARModel(nn.Module):
             "smap": loss_smap,
             "box": loss_box,
             "anomaly": loss_anomaly,
+            "action": loss_action,
         }
         total = self.weighter(losses)
-        
+
         # components are returned NON-detached so the trainer's per-loss grad-norm diagnostic
         # (train.grad_norm_every) can backprop through them; harmless for logging (.item()).
         return {
@@ -170,6 +185,7 @@ class STARModel(nn.Module):
             "loss_smap": loss_smap,
             "loss_box": loss_box,
             "loss_anomaly": loss_anomaly,
+            "loss_action": loss_action,
         }
 
     @torch.no_grad()
