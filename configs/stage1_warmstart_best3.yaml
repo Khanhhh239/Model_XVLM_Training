@@ -74,10 +74,13 @@ optim:
   epochs: 6                      # early-stop usually fires at 2-3
 
 train:
-  batch_size: 12                # T4 16GB @384 (fallback 8 if OOM); even (PairBatchSampler)
-  grad_accum: 2                 # effective 24
+  batch_size: 8                 # T4 16GB @384: 8 because ITM(3N) + phrase-box(P*N) cross-encodes are
+                                # heavy AND grad_checkpointing is NOT wired into X-VLM (see below).
+                                # Bump to 10-12 only if the overfit-one-batch smoke shows <13G VRAM.
+  grad_accum: 3                 # effective 24 (XBM 8192 carries the contrastive negatives, not accum)
   amp_dtype: fp16               # T4 has no bf16
-  grad_checkpointing: true
+  grad_checkpointing: true      # NOTE: currently a NO-OP flag (not wired to the X-VLM swin/bert);
+                                # real OOM control here is batch_size + phrase_box_p. Wire later if needed.
   eval_every_epochs: 0.5
   early_stop_patience: 2
   grad_norm_every: 0
