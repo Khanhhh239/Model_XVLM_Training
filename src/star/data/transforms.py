@@ -58,6 +58,12 @@ def _aug_coarse_dropout(p):
                            min_holes=1, min_height=16, min_width=16, p=p)
 
 
+def _aug_rrc(size, min_scale):                            # RandomResizedCrop: 2.x uses size=(h,w)
+    if _ALBU_MAJOR >= 2:
+        return A.RandomResizedCrop(size=(size, size), scale=(min_scale, 1.0))
+    return A.RandomResizedCrop(height=size, width=size, scale=(min_scale, 1.0))
+
+
 def _normal_p(mean: float = 0.5, var: float = 1.0 / 6.0) -> float:
     return random.gauss(mean, var ** 0.5)
 
@@ -127,7 +133,7 @@ class LHPTransform:
             crop_coords = self._get_local_crop(W, H, bbox, self.min_scale)
             augs.append(A.Crop(x_min=int(crop_coords[0]), y_min=int(crop_coords[1]), x_max=int(crop_coords[2]), y_max=int(crop_coords[3])))
         elif is_local:
-            augs.append(A.RandomResizedCrop(height=self.size, width=self.size, scale=(self.min_scale, 1.0)))
+            augs.append(_aug_rrc(self.size, self.min_scale))
             
         augs.extend([
             # Sim2Real: match blurry/noisy real gallery frames (group E #5/#4 sharpness, F low-light)
