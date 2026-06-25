@@ -1,0 +1,74 @@
+# STAGE 1.5 (SAFE) — warm-start best (3).pth and DO NO HARM.
+# Diagnosis of the kitchen-sink run (mAP 0.6873 floor -> 0.64 -> 0.667, early stop): warm-start was
+# perturbed by 4 fresh heads + XBM(stale) + ANCE(50% swap) at once while lr_lora=1.5e-5 was too small
+# to recover. This config strips back to ONLY the recipe that PRODUCED 0.80 (pair-batch + ITM + SmoothAP)
+# so we can (a) confirm the baseline returns to ~0.80 on the original split, and (b) see whether gentle
+# fine-tuning beats 0.80 at all. Add ONE lever at a time AFTER this run, never all at once.
+# Run:  python scripts/train.py --config configs/stage1_safe_warmstart.yaml --init-from <best(3).pth>
+
+data:
+  manifest: /kaggle/working/manifest_30k_hard_enhanced.parquet
+  image_root: /kaggle/input/aicity-30k-hard-enhanced/data/train_webp
+  image_size: 384
+  max_token: 100
+  lhp_enabled: true               # LHP + sim2real aug — part of the 0.80 recipe
+  lhp_min_scale: 0.5
+  lhp_use_bbox: true
+  group_by: pair                  # PairBatchSampler — THE proven lever (v3c +0.083 mAP)
+  group_fraction: 0.5
+  num_workers: 2
+  vitpose_json: /kaggle/input/aicity-30k-hard-enhanced/data/subsets/prepared/train_30k_hard_vitpose.json
+  boxes_json: null
+  phrase_boxes_json: null         # OFF — fresh noisy head, add later if Run 1 succeeds
+  remine_each_epoch: false        # OFF — pure same-video pair-batch (what made 0.80)
+  mine_fraction: 0.0
+  hard_edges_json: null
+
+model:
+  backbone: xvlm
+  checkpoint: /kaggle/input/ckpt-30k-hard/xvlm_16m_base.th
+  embed_dim: 256
+  lora_enabled: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_targets: [query, value]
+  lora_freeze_text: true
+  pose_enabled: true              # part of best(3); needed for eval consistency
+  pose_hidden: 256
+  bbox_enabled: false             # OFF — fresh head, no harm
+  anomaly_enabled: false          # OFF
+  phrase_box_enabled: false       # OFF
+
+loss:
+  w_itc: 1.0
+  lambda_itm: 2.0                 # ITM hard-neg — the main rank-1 lever (kept)
+  lambda_smooth_ap: 0.2          # kept
+  lambda_box: 0.0
+  lambda_anomaly: 0.0
+  lambda_action: 0.0
+  lambda_phrase_box: 0.0
+  xbm_enabled: false             # OFF — stale negatives hurt at this LR
+  weighting: fixed
+  itc_temp_init: 0.07
+  smooth_ap_temp: 0.01
+
+optim:
+  lr_lora: 1.5e-5
+  lr_head: 1.0e-4
+  weight_decay: 0.02
+  betas: [0.9, 0.999]
+  grad_clip: 5.0
+  warmup_epochs: 0.5
+  epochs: 6
+
+train:
+  batch_size: 12                 # no phrase-box cross-encodes now -> 12 fits comfortably (was 8.1G @ bs12)
+  grad_accum: 2                  # effective 24
+  amp_dtype: fp16
+  grad_checkpointing: true       # no-op flag (documented)
+  eval_every_epochs: 0.5
+  early_stop_patience: 2
+  grad_norm_every: 0
+  seed: 42
+  out_dir: /kaggle/working/out_stage1_safe
