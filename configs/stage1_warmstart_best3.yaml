@@ -23,7 +23,8 @@ data:
   phrase_boxes_json: /kaggle/input/bbox-dataset/boxes_30k.json   # GroundingDINO phrase boxes (#3)
   # STAGE 1.5 re-mining + swap-pairs
   remine_each_epoch: true         # re-mine cross-ID hard negatives with the current model each epoch
-  mine_fraction: 0.5              # half the pair pool = mined cross-ID, rest = same-video (+ hard_edges)
+  mine_fraction: 0.1              # REDUCED 0.5->0.1: 50% ANCE killed same-video signal in epoch 0.
+                                  # Keep 90% same-video; mined 10% adds diversity without destroying the warm-start.
   hard_edges_json: /kaggle/input/aicity-30k-hard-enhanced/data/subsets/hard_edges_30k_hard.jsonl
 
 model:
@@ -59,7 +60,8 @@ loss:
                                  # if it regresses, denoise (min_score in load_phrase_boxes) before re-raising.
   phrase_box_p: 2                # max noun-phrases (boxes) per image
   xbm_enabled: true              # NEW — extra ITC negatives on the small T4 batch
-  xbm_size: 8192
+  xbm_size: 1024                 # REDUCED 8192->1024: lr=1.5e-5 barely moves model; 8192=683 batches back
+                                 # -> stale embeddings cause noisy ITC gradient. 1024=~85 batches back.
   weighting: fixed
   itc_temp_init: 0.07
   smooth_ap_temp: 0.01

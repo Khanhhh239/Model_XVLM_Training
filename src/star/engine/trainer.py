@@ -235,7 +235,12 @@ class Trainer:
                         lr = self.scheduler.get_last_lr()[0]
                         msg = (f"e{epoch} s{self.step} loss={out['loss'].item():.3f} "
                                f"itc={out['loss_itc']:.3f} itm={out['loss_itm']:.3f} "
-                               f"smap={out['loss_smap']:.3f} lr={lr:.2e}")
+                               f"smap={out['loss_smap']:.3f} "
+                               f"box={out['loss_box'].item():.3f} "
+                               f"anom={out['loss_anomaly'].item():.3f} "
+                               f"act={out['loss_action'].item():.3f} "
+                               f"pbox={out['loss_pbox'].item():.3f} "
+                               f"lr={lr:.2e}")
                         if torch.cuda.is_available():
                             msg += f" vram={torch.cuda.max_memory_allocated()/2**30:.1f}G"
                         weights_fn = getattr(self.model.weighter, "weights", None)
