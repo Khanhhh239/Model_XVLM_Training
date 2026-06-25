@@ -21,6 +21,8 @@ def _cfg() -> Config:
     cfg.loss.lambda_box = 0.1
     cfg.loss.lambda_anomaly = 0.2
     cfg.loss.lambda_action = 0.2
+    cfg.model.phrase_box_enabled = True
+    cfg.loss.lambda_phrase_box = 0.1
     return cfg
 
 
@@ -39,6 +41,10 @@ def _batch(b=4, L=16):
         "action_attention_mask": torch.ones(b, 8, dtype=torch.long),
         "action_group": torch.tensor([0, 0, 1, 1]),
         "action_valid": torch.ones(b, dtype=torch.bool),
+        "phrase_input_ids": torch.randint(5, 900, (b, 2, 8)),         # [B, P=2, L=8]
+        "phrase_attention_mask": torch.ones(b, 2, 8, dtype=torch.long),
+        "phrase_box": torch.rand(b, 2, 4) * 0.5 + 0.2,                # xywh in (0.2, 0.7)
+        "phrase_mask": torch.ones(b, 2),
     }
 
 
@@ -46,11 +52,13 @@ def test_all_heads_forward_and_backward():
     torch.manual_seed(0)
     model = STARModel(_cfg())
     out = model(_batch(), step=10)
-    keys = {"loss", "loss_itc", "loss_itm", "loss_smap", "loss_box", "loss_anomaly", "loss_action"}
+    keys = {"loss", "loss_itc", "loss_itm", "loss_smap", "loss_box", "loss_anomaly",
+            "loss_action", "loss_pbox"}
     assert set(out) == keys
     for k in keys:
         assert torch.isfinite(torch.as_tensor(out[k])), f"{k} not finite"
     assert out["loss_action"].item() > 0      # action loss actually computed (valid rows present)
+    assert out["loss_pbox"].item() > 0        # phrase-box loss computed (valid phrase boxes present)
     out["loss"].backward()                    # whole multi-head graph is differentiable
 
 

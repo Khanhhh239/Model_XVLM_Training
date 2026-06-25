@@ -183,6 +183,23 @@ class Trainer:
         eval_every = max(1, int(len(self.train_loader) * self.cfg.train.eval_every_epochs))
         accum = self.cfg.train.grad_accum
         t0 = time.time()
+
+        # SAFETY FLOOR (F1): establish the warm-init baseline so best.pth is overwritten ONLY when a
+        # later eval BEATS the warm-start (best (3).pth). Without this, best_metric=-1 makes the first
+        # eval save an unconditional best.pth even below 0.80 -> could ship a worse model than best(3).
+        if self.step == 0 and self.val_dataset is not None and self.best_metric < 0:
+            from ..config import to_dict
+            from .evaluator import evaluate_retrieval
+            base = evaluate_retrieval(self.model, self.val_dataset, self.device,
+                                      num_workers=self.cfg.data.num_workers)
+            self.best_metric = base["mAP"]
+            save_checkpoint(str(self.out_dir / "best.pth"), self.model, self.optimizer, self.scheduler,
+                            self.step, self.best_metric, {"report": base, "cfg": to_dict(self.cfg),
+                                                          "baseline": True})
+            log.info(f"[baseline] warm-init VAL-B mAP={self.best_metric:.4f} -> best.pth FLOOR set "
+                     f"(only overwritten if a later eval beats this)")
+            self.model.train()
+
         for epoch in range(self.start_epoch, self.cfg.optim.epochs):
             if getattr(self, "_remine_enabled", False):
                 self._remine(epoch)               # re-mine cross-ID pairs with the current model

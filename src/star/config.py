@@ -28,7 +28,8 @@ class DataConfig:
     num_workers: int = 8
     # STAGE 1: External data sources
     vitpose_json: str | None = None   # Path to vitpose keypoints JSON
-    boxes_json: str | None = None     # Path to bounding boxes JSONL
+    boxes_json: str | None = None     # Path to bounding boxes JSONL (single person-box override)
+    phrase_boxes_json: str | None = None  # phrase-grounded boxes (boxes_30k.json) for PhraseBoxHead
     # STAGE 1.5: ANCE re-mining + swap-pair (group B). The trainer re-mines cross-ID hard pairs each
     # epoch and blends them with the same-video pairs + hard_edges into the PairBatchSampler pool.
     remine_each_epoch: bool = False   # re-mine cross-ID hard negatives before each epoch
@@ -52,8 +53,9 @@ class ModelConfig:
     pose_enabled: bool = False
     pose_hidden: int = 256
     # STAGE 1: New heads
-    bbox_enabled: bool = False        # Box grounding head (spatial understanding)
+    bbox_enabled: bool = False        # Box grounding head (single person-box, spatial understanding)
     anomaly_enabled: bool = False     # Anomaly classification head (normal vs abnormal)
+    phrase_box_enabled: bool = False  # Phrase-grounded box head (group D: multi-person / #3)
 
 
 @dataclass
@@ -63,14 +65,21 @@ class LossConfig:
     lambda_itm: float = 1.0           # λ1 — ITC:ITM = 1:1 is the proven X-VLM/ALBEF ratio: keep
     lambda_smooth_ap: float = 0.3     # λ2 — the ONE real unknown: sweep {0, 0.1, 0.3, 1.0} on VAL-B
     # STAGE 1: New losses
-    lambda_box: float = 0.1           # Box grounding loss weight
+    lambda_box: float = 0.1           # Box grounding loss weight (single person-box head)
     w_box_giou: float = 2.0           # GIoU weight within box loss
     w_box_l1: float = 5.0             # L1 weight within box loss (ratio GIoU:L1 = 2:5)
+    box_rampup_steps: int = 500       # ramp box weight 0->full over N steps (fresh head -> stable)
     lambda_anomaly: float = 0.2       # Anomaly classification loss weight
     anomaly_rampup_steps: int = 500   # Gradually increase anomaly weight from 0 to full over N steps
     # Action-keyword alignment (group C: action/pose mismatch). 0 = off.
     lambda_action: float = 0.0        # image <-> action-phrase contrastive weight
     action_temp: float = 0.07         # softmax temperature for the action loss
+    action_rampup_steps: int = 500    # ramp action weight 0->full over N steps
+    # Phrase-grounded box head (group D: multi-person / #3 spatial). 0 = off. (toggle is in ModelConfig)
+    lambda_phrase_box: float = 0.0    # weight for the phrase-box loss
+    phrase_box_p: int = 2             # max phrases (boxes) per image
+    phrase_box_src_size: int = 384    # pixel size the boxes_30k boxes were generated at (xyxy@384)
+    phrase_box_rampup: int = 500      # ramp phrase-box weight 0->full over N steps
     # XBM Queue (Cross-Batch Memory for extra ITC negatives)
     xbm_enabled: bool = False         # Enable XBM queue for ITC
     xbm_size: int = 8192              # Queue capacity (8192 = ~27% of 30K dataset)

@@ -129,6 +129,24 @@ def _parse_anomaly_label(row) -> tuple[int, bool]:
     return 0, False
 
 
+def load_phrase_boxes(path, topk: int = 2, min_score: float = 0.3) -> dict:
+    """Phrase-grounded boxes for the PhraseBoxHead (group D). Accepts a JSON array OR JSONL of
+    {image_id, boxes:[{phrase, box:[x1,y1,x2,y2] pixel, score}]}. Returns image_id -> top-k boxes."""
+    out: dict = {}
+    if not path or not Path(path).exists():
+        return out
+    raw = open(path, encoding="utf-8").read().strip()
+    recs = json.loads(raw) if raw.startswith("[") else [json.loads(x) for x in raw.splitlines() if x.strip()]
+    for d in recs:
+        key = str(d.get("image_id") or d.get("image_path") or "")
+        bs = [b for b in d.get("boxes", [])
+              if b.get("box") and len(b["box"]) == 4 and float(b.get("score", 1.0)) >= min_score]
+        bs = sorted(bs, key=lambda b: -float(b.get("score", 1.0)))[:topk]
+        if key and bs:
+            out[key] = bs
+    return out
+
+
 class PABDataset(Dataset):
     def __init__(
         self,
@@ -142,6 +160,9 @@ class PABDataset(Dataset):
         lhp_kwargs: dict | None = None,
         vitpose_json: str | None = None,
         boxes_json: str | None = None,
+        phrase_boxes_json: str | None = None,
+        phrase_box_p: int = 2,
+        phrase_box_src_size: int = 384,
     ):
         manifest_path = Path(manifest)
         if manifest_path.suffix == ".parquet":
@@ -175,6 +196,13 @@ class PABDataset(Dataset):
                     key = item.get("image_id") or item.get("image_path")
                     if key and item.get("bbox"):
                         self.boxes_dict[str(key)] = item["bbox"]
+
+        # phrase-grounded boxes (group D). Active only when a phrase-box json is given.
+        self.P = int(phrase_box_p)
+        self.phrase_box_src = float(phrase_box_src_size or image_size)
+        self.phrase_boxes = load_phrase_boxes(phrase_boxes_json, topk=self.P)
+        self.phrase_on = bool(self.phrase_boxes)
+        self._phr_L = min(max_token, 32)
 
     def __len__(self) -> int:
         return len(self.df)
@@ -238,8 +266,22 @@ class PABDataset(Dataset):
         if kpts_raw is None:
             kpts_raw = _kpts_from_vitpose(self.vitpose_dict, image_id, image_path)
 
+        # phrase-grounded boxes -> pixel xyxy in THIS image's coords (boxes stored pixel @ src_size)
+        phr_strs, phr_voc = [], []
+        if self.phrase_on:
+            sx, sy = img_w / self.phrase_box_src, img_h / self.phrase_box_src
+            for b in self.phrase_boxes.get(image_id, [])[: self.P]:
+                x1, y1, x2, y2 = b["box"]
+                phr_voc.append([x1 * sx, y1 * sy, x2 * sx, y2 * sy])
+                phr_strs.append(str(b.get("phrase", "") or "object"))
+
+        ph_box = ph_valid = None
         if self.train and isinstance(self.transform, LHPTransform):
-            image, bbox_aug, kpts_aug = self.transform(img, bbox_voc, kpts_raw)
+            if self.phrase_on:
+                image, bbox_aug, kpts_aug, ph_box, ph_valid = self.transform(
+                    img, bbox_voc, kpts_raw, extra_boxes=phr_voc)
+            else:
+                image, bbox_aug, kpts_aug = self.transform(img, bbox_voc, kpts_raw)
             bbox_norm = None
             if bbox_aug is not None and bbox_aug.numel() == 4:
                 x1, y1, x2, y2 = bbox_aug.tolist()
@@ -251,6 +293,13 @@ class PABDataset(Dataset):
             if bbox_voc is not None:
                 bbox_norm = _xyxy_to_coco_xywh_norm(*bbox_voc, img_w, img_h)
             kpts = kpts_raw
+            if self.phrase_on:                              # no geometric aug -> normalize directly
+                ph_box, ph_valid = torch.zeros(len(phr_voc), 4), torch.zeros(len(phr_voc))
+                for k, (x1, y1, x2, y2) in enumerate(phr_voc):
+                    if x2 > x1 and y2 > y1:
+                        ph_box[k] = torch.tensor([((x1 + x2) / 2) / img_w, ((y1 + y2) / 2) / img_h,
+                                                  (x2 - x1) / img_w, (y2 - y1) / img_h])
+                        ph_valid[k] = 1.0
 
         caption = str(row.get("caption", ""))
         tok = self.tokenizer(
@@ -291,6 +340,24 @@ class PABDataset(Dataset):
 
         if kpts is not None and len(kpts) == 51:
             item["keypoints"] = torch.tensor(kpts, dtype=torch.float)
+
+        if self.phrase_on:
+            P, L = self.P, self._phr_L
+            pid = torch.zeros(P, L, dtype=torch.long)
+            pmask = torch.zeros(P, L, dtype=torch.long)
+            for k in range(min(P, len(phr_strs))):
+                t = self.tokenizer(phr_strs[k], padding="max_length", truncation=True,
+                                   max_length=L, return_tensors="pt")
+                pid[k] = t["input_ids"].squeeze(0)
+                pmask[k] = t["attention_mask"].squeeze(0)
+            pbox, pval = torch.zeros(P, 4), torch.zeros(P)
+            if ph_box is not None and ph_box.numel():
+                n = min(P, ph_box.shape[0])
+                pbox[:n], pval[:n] = ph_box[:n], ph_valid[:n]
+            item["phrase_input_ids"] = pid
+            item["phrase_attention_mask"] = pmask
+            item["phrase_box"] = pbox
+            item["phrase_mask"] = pval
 
         return item
 
@@ -334,5 +401,11 @@ def collate_fn(batch: list[dict]) -> dict:
         out["action_attention_mask"] = torch.stack([b["action_attention_mask"] for b in batch])
         out["action_group"] = torch.tensor(_action_groups(batch), dtype=torch.long)
         out["action_valid"] = torch.tensor([b["action_valid"] for b in batch], dtype=torch.bool)
+
+    if all("phrase_input_ids" in b for b in batch):
+        out["phrase_input_ids"] = torch.stack([b["phrase_input_ids"] for b in batch])       # [B,P,L]
+        out["phrase_attention_mask"] = torch.stack([b["phrase_attention_mask"] for b in batch])
+        out["phrase_box"] = torch.stack([b["phrase_box"] for b in batch])                   # [B,P,4]
+        out["phrase_mask"] = torch.stack([b["phrase_mask"] for b in batch])                 # [B,P]
 
     return out

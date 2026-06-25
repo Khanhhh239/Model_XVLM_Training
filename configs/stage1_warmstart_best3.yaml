@@ -19,7 +19,8 @@ data:
   group_fraction: 0.5
   num_workers: 2                  # Kaggle ~4 vCPU
   vitpose_json: /kaggle/input/aicity-30k-hard-enhanced/data/subsets/prepared/train_30k_hard_vitpose.json
-  boxes_json: null                # box GT comes free from vitpose primary_bbox; set a jsonl to override
+  boxes_json: null                # person-box GT comes free from vitpose primary_bbox
+  phrase_boxes_json: /kaggle/input/bbox-dataset/boxes_30k.json   # GroundingDINO phrase boxes (#3)
   # STAGE 1.5 re-mining + swap-pairs
   remine_each_epoch: true         # re-mine cross-ID hard negatives with the current model each epoch
   mine_fraction: 0.5              # half the pair pool = mined cross-ID, rest = same-video (+ hard_edges)
@@ -37,8 +38,9 @@ model:
   lora_freeze_text: true
   pose_enabled: true              # keypoint-MLP PoseBranch (already trained in best (3).pth)
   pose_hidden: 256
-  bbox_enabled: true              # NEW head (fresh) — spatial grounding
+  bbox_enabled: true              # NEW head (fresh) — single person-box (ViTPose) grounding
   anomaly_enabled: true           # NEW head (fresh) — normal vs anomaly (Ca/Cn)
+  phrase_box_enabled: true        # NEW head (fresh) — phrase-grounded multi-box (#3 multi-person)
 
 loss:
   w_itc: 1.0
@@ -51,6 +53,8 @@ loss:
   anomaly_rampup_steps: 500
   lambda_action: 0.2             # NEW — image <-> action-phrase alignment (#C)
   action_temp: 0.07
+  lambda_phrase_box: 0.1         # NEW — phrase-grounded box (#3 multi-person); GIoU:L1=2:5, ramped
+  phrase_box_p: 2                # max noun-phrases (boxes) per image
   xbm_enabled: true              # NEW — extra ITC negatives on the small T4 batch
   xbm_size: 8192
   weighting: fixed

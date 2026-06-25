@@ -127,6 +127,34 @@ class AnomalyClassificationHead(nn.Module):
         return F.cross_entropy(logits[mask], labels[mask])
 
 
+class PhraseBoxHead(nn.Module):
+    """Phrase-grounded box head (wrong-case group D: multi-person / #3 spatial).
+
+    Predicts ONE box [x, y, w, h] in [0,1] from the CROSS-encoded (image, noun-phrase) [CLS] vector
+    (backbone.cross_feature). Run once per caption noun-phrase -> grounds each phrase to its region,
+    teaching the model WHICH person/object the caption refers to. Reuses BoxGroundingHead.compute_loss
+    (masked GIoU+L1) on the up-to-P phrase boxes per image.
+    """
+
+    def __init__(self, cross_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(cross_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, 4),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, cross_cls: Tensor) -> Tensor:
+        """cross_cls: [N, cross_dim] fused [CLS]. Returns [N, 4] box [x, y, w, h] in [0, 1]."""
+        return self.mlp(cross_cls)
+
+    @staticmethod
+    def compute_loss(pred, gt, mask=None, w_giou: float = 2.0, w_l1: float = 5.0):
+        return BoxGroundingHead.compute_loss(pred, gt, mask=mask, w_giou=w_giou, w_l1=w_l1)
+
+
 def compute_giou_loss(boxes1: Tensor, boxes2: Tensor) -> Tensor:
     """Generalized IoU loss (1 - GIoU).
     

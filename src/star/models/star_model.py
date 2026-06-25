@@ -19,7 +19,7 @@ from ..losses import ITCLoss, ITMLoss, SmoothAPLoss, action_alignment_loss, buil
 from ..losses.weighting import build_weighter
 from ..losses.xbm_queue import XBMQueue
 from .backbone import build_backbone
-from .heads import AnomalyClassificationHead, BoxGroundingHead
+from .heads import AnomalyClassificationHead, BoxGroundingHead, PhraseBoxHead
 from .lora import count_trainable, mark_only_lora_trainable
 from .pose import PoseBranch
 
@@ -39,6 +39,9 @@ class STARModel(nn.Module):
         # STAGE 1: New heads for box grounding + anomaly classification
         self.bbox_head = BoxGroundingHead(cfg.model.embed_dim) if cfg.model.bbox_enabled else None
         self.anomaly_head = AnomalyClassificationHead(cfg.model.embed_dim) if cfg.model.anomaly_enabled else None
+        # phrase-grounded box head (group D): sized to the cross-encoder [CLS] width
+        self.phrase_box_head = (PhraseBoxHead(self.backbone.cross_width)
+                                if getattr(cfg.model, "phrase_box_enabled", False) else None)
 
         # XBM Queue for ITC (provides extra negatives from past batches)
         self.xbm_queue = XBMQueue(size=cfg.loss.xbm_size, dim=cfg.model.embed_dim) if cfg.loss.xbm_enabled else None
@@ -60,7 +63,7 @@ class STARModel(nn.Module):
             # STAGE 2: LoRA enabled -> train only LoRA params + task heads
             mark_only_lora_trainable(
                 self, train_heads=("itm_head", "img_proj", "vision_proj", "pose", "temp", "gate",
-                                   "weighter", "bbox_head", "anomaly_head"),
+                                   "weighter", "bbox_head", "anomaly_head", "phrase_box_head"),
             )
         else:
             # STAGE 1: No LoRA -> freeze vision encoder + text encoder, train cross-attention + heads
@@ -136,6 +139,8 @@ class STARModel(nn.Module):
                 w_giou=self.cfg.loss.w_box_giou,
                 w_l1=self.cfg.loss.w_box_l1,
             )
+            if self.cfg.loss.box_rampup_steps > 0:           # ramp fresh head 0->full
+                loss_box = loss_box * min(1.0, step / self.cfg.loss.box_rampup_steps)
 
         # ---- STAGE 1: Anomaly Classification Loss ----
         loss_anomaly = torch.tensor(0.0, device=device)
@@ -164,6 +169,28 @@ class STARModel(nn.Module):
                 loss_action = action_alignment_loss(
                     img_feat[vmask], act_feat[vmask], batch["action_group"][vmask],
                     temp=self.cfg.loss.action_temp)
+                if self.cfg.loss.action_rampup_steps > 0:    # ramp 0->full
+                    loss_action = loss_action * min(1.0, step / self.cfg.loss.action_rampup_steps)
+
+        # ---- Phrase-grounded box (group D: multi-person / #3) ----
+        # cross-encode (image, each caption noun-phrase) -> [CLS] -> box; masked GIoU+L1 over P phrases.
+        loss_pbox = torch.tensor(0.0, device=device)
+        if (self.phrase_box_head is not None and "phrase_input_ids" in batch
+                and batch.get("phrase_mask") is not None and bool(batch["phrase_mask"].any())):
+            B, P, Lp = batch["phrase_input_ids"].shape
+            flat_ids = batch["phrase_input_ids"].reshape(B * P, Lp)
+            flat_mask = batch["phrase_attention_mask"].reshape(B * P, Lp)
+            ph_embeds, _ = self.backbone.encode_text(flat_ids, flat_mask)
+            ie = img_embeds.unsqueeze(1).expand(B, P, *img_embeds.shape[1:]).reshape(B * P, *img_embeds.shape[1:])
+            cross_cls = self.backbone.cross_feature(ie, ph_embeds, flat_mask)      # [B*P, cross_width]
+            pred = self.phrase_box_head(cross_cls)                                  # [B*P, 4]
+            gt = batch["phrase_box"].reshape(B * P, 4)
+            m = batch["phrase_mask"].reshape(B * P).bool()
+            loss_pbox = PhraseBoxHead.compute_loss(pred, gt, mask=m,
+                                                   w_giou=self.cfg.loss.w_box_giou,
+                                                   w_l1=self.cfg.loss.w_box_l1)
+            if self.cfg.loss.phrase_box_rampup > 0:
+                loss_pbox = loss_pbox * min(1.0, step / self.cfg.loss.phrase_box_rampup)
 
         # ---- total: weighter combines the tasks ----
         losses = {
@@ -173,6 +200,7 @@ class STARModel(nn.Module):
             "box": loss_box,
             "anomaly": loss_anomaly,
             "action": loss_action,
+            "pbox": loss_pbox,
         }
         total = self.weighter(losses)
 
@@ -186,6 +214,7 @@ class STARModel(nn.Module):
             "loss_box": loss_box,
             "loss_anomaly": loss_anomaly,
             "loss_action": loss_action,
+            "loss_pbox": loss_pbox,
         }
 
     @torch.no_grad()

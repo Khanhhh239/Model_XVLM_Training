@@ -59,7 +59,16 @@ def main():
                     "enabled": cfg.data.lhp_enabled},
         vitpose_json=getattr(cfg.data, "vitpose_json", None),
         boxes_json=getattr(cfg.data, "boxes_json", None),
+        phrase_boxes_json=(getattr(cfg.data, "phrase_boxes_json", None)
+                           if cfg.model.phrase_box_enabled else None),
+        phrase_box_p=cfg.loss.phrase_box_p,
+        phrase_box_src_size=cfg.loss.phrase_box_src_size,
     )
+    # F2: warn loudly if a loss is enabled but its manifest source is missing (silent no-op otherwise)
+    if cfg.loss.lambda_action > 0 and "action" not in train_ds.df.columns:
+        log.warning("[manifest] lambda_action>0 but manifest has NO 'action' column -> action loss = 0")
+    if cfg.model.phrase_box_enabled and not train_ds.phrase_on:
+        log.warning("[manifest] phrase_box_enabled but NO phrase boxes loaded -> phrase-box loss = 0")
     val_ds = PABDataset(
         cfg.data.manifest, cfg.data.image_root, tokenizer, split="valb",
         image_size=cfg.data.image_size, max_token=cfg.data.max_token, train=False,

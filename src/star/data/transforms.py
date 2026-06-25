@@ -86,7 +86,7 @@ class LHPTransform:
         side = int(min(side, W - left, H - top))
         return [left, top, left + side, top + side]
 
-    def __call__(self, img: Image.Image, bbox=None, keypoints=None):
+    def __call__(self, img: Image.Image, bbox=None, keypoints=None, extra_boxes=None):
         img_np = np.array(img.convert("RGB"))
         H, W, _ = img_np.shape
         
@@ -144,27 +144,55 @@ class LHPTransform:
             ToTensorV2(),
         ])
         
-        transform = A.Compose(augs, 
-                              bbox_params=A.BboxParams(format='pascal_voc', label_fields=['bbox_classes']),
+        # box list: person (label 0) + optional phrase boxes (labels 1..P), all clamped to the image.
+        # Phrase boxes go through the SAME crop/resize as the image so their targets stay aligned;
+        # boxes cropped fully out are dropped by albumentations -> marked invalid via the label map.
+        def _clamp(b):
+            return [max(0.0, float(b[0])), max(0.0, float(b[1])),
+                    min(float(W), float(b[2])), min(float(H), float(b[3]))]
+        box_list, box_labels = [bbox], [0]
+        if extra_boxes:
+            for k, eb in enumerate(extra_boxes):
+                cb = _clamp(eb)
+                if cb[0] < cb[2] and cb[1] < cb[3]:
+                    box_list.append(cb); box_labels.append(k + 1)
+
+        transform = A.Compose(augs,
+                              bbox_params=A.BboxParams(format='pascal_voc', label_fields=['bbox_classes'],
+                                                       min_visibility=0.0),
                               keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
-        
         try:
-            transformed = transform(image=img_np, bboxes=[bbox], bbox_classes=[1], keypoints=kpts_xy)
+            transformed = transform(image=img_np, bboxes=box_list, bbox_classes=box_labels, keypoints=kpts_xy)
         except Exception:
-            # Fallback
-            transformed = transform(image=img_np, bboxes=[[0.0, 0.0, float(W), float(H)]], bbox_classes=[1], keypoints=kpts_xy)
-            
+            transformed = transform(image=img_np, bboxes=[[0.0, 0.0, float(W), float(H)]],
+                                    bbox_classes=[0], keypoints=kpts_xy)
+
         out_img = transformed['image']
-        out_bbox = transformed['bboxes'][0] if transformed['bboxes'] else [0,0,0,0]
+        by_label = {int(l): b for b, l in zip(transformed['bboxes'], transformed['bbox_classes'])}
+        out_bbox = by_label.get(0, [0, 0, 0, 0])                       # person box (pixel xyxy @ size)
         out_kpts_xy = transformed['keypoints']
-        
+
         out_kpts = []
         for (x, y), c in zip(out_kpts_xy, kpts_c):
             if x < 0 or x >= self.size or y < 0 or y >= self.size:
                 c = 0.0
             out_kpts.extend([x / self.size, y / self.size, c])
-            
-        return out_img, torch.tensor(out_bbox, dtype=torch.float), torch.tensor(out_kpts, dtype=torch.float)
+
+        person_t = torch.tensor(out_bbox, dtype=torch.float)
+        kpts_t = torch.tensor(out_kpts, dtype=torch.float)
+        if extra_boxes is None:
+            return out_img, person_t, kpts_t
+        # phrase boxes -> normalized center xywh + validity (dropped-out boxes => mask 0)
+        P = len(extra_boxes)
+        ph_box, ph_valid = torch.zeros(P, 4), torch.zeros(P)
+        for k in range(P):
+            b = by_label.get(k + 1)
+            if b is not None and b[2] > b[0] and b[3] > b[1]:
+                x1, y1, x2, y2 = b
+                ph_box[k] = torch.tensor([((x1 + x2) / 2) / self.size, ((y1 + y2) / 2) / self.size,
+                                          (x2 - x1) / self.size, (y2 - y1) / self.size])
+                ph_valid[k] = 1.0
+        return out_img, person_t, kpts_t, ph_box, ph_valid
 
 
 def build_eval_transform(size: int = 384):

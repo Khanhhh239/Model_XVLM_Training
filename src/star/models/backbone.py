@@ -119,6 +119,7 @@ class DummyBackbone(nn.Module):
         super().__init__()
         self.tokenizer = SimpleTokenizer(vocab_size=vocab)
         self.net = _DummyXVLM(embed=embed_dim, vocab=vocab)
+        self.cross_width = self.net.hidden          # dim of cross_feature() [CLS] (for PhraseBoxHead)
 
     def encode_image(self, image):
         return self.net.encode_image(image)
@@ -202,6 +203,7 @@ class XVLMBackbone(nn.Module):
         self.model.load_pretrained(str(ckpt), self._build_cfg, is_eval=False)
         self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         self.temp = self.model.temp     # share the PRETRAINED temperature with ITCLoss (fix #6)
+        self.cross_width = getattr(self.model, "text_width", 768)   # cross_feature [CLS] dim (PhraseBoxHead)
 
     # ----- interface used by STARModel -----
     def encode_image(self, image):

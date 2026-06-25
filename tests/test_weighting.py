@@ -23,8 +23,8 @@ def test_uncertainty_equals_fixed_at_init_and_gets_grad():
     assert torch.isclose(total, torch.tensor(2.0 + 0.7 + 0.12))
     total.backward()
     assert w.log_var.grad is not None and torch.isfinite(w.log_var.grad).all()
-    # STAGE 1.5: now 6 tasks (added the action-keyword alignment loss)
-    assert set(w.weights()) == {"itc", "itm", "smap", "box", "anomaly", "action"}
+    # STAGE 1.5: now 7 tasks (added action-keyword + phrase-grounded box)
+    assert set(w.weights()) == {"itc", "itm", "smap", "box", "anomaly", "action", "pbox"}
 
 
 def test_dwa_equal_weights_until_history_then_upweights_slow_task():
@@ -33,8 +33,8 @@ def test_dwa_equal_weights_until_history_then_upweights_slow_task():
     w(_losses(1.0, 0.7, 0.4))           # itc descends fast; itm/smap flat
     w(_losses(0.9, 0.7, 0.4))           # weights from history now apply
     k = w.weights()
-    # STAGE 1.5: now 6 tasks, so sum = 6.0 (softmax * K sums to K)
-    assert abs(sum(k.values()) - 6.0) < 1e-4
+    # STAGE 1.5: now 7 tasks, so sum = 7.0 (softmax * K sums to K)
+    assert abs(sum(k.values()) - 7.0) < 1e-4
     assert k["itc"] < k["itm"]                        # fast-descending itc down-weighted
 
 
