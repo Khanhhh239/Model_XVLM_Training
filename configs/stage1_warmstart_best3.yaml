@@ -58,7 +58,11 @@ loss:
                                  # raised 0.1->0.3 (user): push grounding of colored/varied objects.
                                  # GT is noisy (GroundingDINO) -> safety-floor reverts if VAL-B drops;
                                  # if it regresses, denoise (min_score in load_phrase_boxes) before re-raising.
-  phrase_box_p: 2                # max noun-phrases (boxes) per image
+  phrase_box_p: 4                # max noun-phrases (boxes) per image — raised 2->4 (user: "dùng hết",
+                                 # the detail matters). load_phrase_boxes keeps top-P by score, so the
+                                 # high-conf person/clothing boxes win and the low-score scene junk
+                                 # (walls/grass ~0.3-0.39) is dropped first. T4: P=4 ~ ok; if Cell-6
+                                 # smoke OOMs, drop to 3 or batch_size 12->8. A100 can push P to 6-8.
   xbm_enabled: true              # NEW — extra ITC negatives on the small T4 batch
   xbm_size: 1024                 # REDUCED 8192->1024: lr=1.5e-5 barely moves model; 8192=683 batches back
                                  # -> stale embeddings cause noisy ITC gradient. 1024=~85 batches back.
