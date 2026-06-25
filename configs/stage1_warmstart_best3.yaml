@@ -53,7 +53,10 @@ loss:
   anomaly_rampup_steps: 500
   lambda_action: 0.2             # NEW — image <-> action-phrase alignment (#C)
   action_temp: 0.07
-  lambda_phrase_box: 0.1         # NEW — phrase-grounded box (#3 multi-person); GIoU:L1=2:5, ramped
+  lambda_phrase_box: 0.3         # NEW — phrase-grounded box (#3, ground colored objects); GIoU:L1=2:5, ramped
+                                 # raised 0.1->0.3 (user): push grounding of colored/varied objects.
+                                 # GT is noisy (GroundingDINO) -> safety-floor reverts if VAL-B drops;
+                                 # if it regresses, denoise (min_score in load_phrase_boxes) before re-raising.
   phrase_box_p: 2                # max noun-phrases (boxes) per image
   xbm_enabled: true              # NEW — extra ITC negatives on the small T4 batch
   xbm_size: 8192
