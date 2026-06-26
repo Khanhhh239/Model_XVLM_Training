@@ -2,6 +2,47 @@
 import torch
 import pytest
 from star.models.heads import BoxGroundingHead, compute_giou_loss
+from star.data.dataset import _bbox_from_kpts
+
+
+def test_bbox_from_kpts_basic():
+    """Keypoint extent -> COCO xywh-norm box. 4 visible joints spanning a 0.2..0.6 square."""
+    kp = [0.0, 0.0, 0.0] * 17
+    pts = {5: (0.2, 0.3), 6: (0.6, 0.3), 11: (0.2, 0.7), 12: (0.6, 0.7)}  # shoulders + hips
+    for j, (x, y) in pts.items():
+        kp[3 * j], kp[3 * j + 1], kp[3 * j + 2] = x, y, 0.9
+    box = _bbox_from_kpts(kp, margin=0.0)
+    assert box is not None
+    cx, cy, w, h = box
+    assert cx == pytest.approx(0.4, abs=1e-6) and cy == pytest.approx(0.5, abs=1e-6)
+    assert w == pytest.approx(0.4, abs=1e-6) and h == pytest.approx(0.4, abs=1e-6)
+
+
+def test_bbox_from_kpts_margin_and_clamp():
+    """Margin expands the box but stays clamped to [0,1]."""
+    kp = [0.0, 0.0, 0.0] * 17
+    for j, (x, y) in {5: (0.02, 0.02), 12: (0.98, 0.98)}.items():
+        kp[3 * j], kp[3 * j + 1], kp[3 * j + 2] = x, y, 0.9
+    box = _bbox_from_kpts(kp, margin=0.05)
+    cx, cy, w, h = box
+    x1, y1 = cx - w / 2, cy - h / 2
+    x2, y2 = cx + w / 2, cy + h / 2
+    assert x1 >= 0.0 and y1 >= 0.0 and x2 <= 1.0 and y2 <= 1.0   # clamped
+
+
+def test_bbox_from_kpts_low_conf_returns_none():
+    """All joints below conf threshold (or fewer than 2 visible) -> None (masked out)."""
+    kp = [0.5, 0.5, 0.05] * 17           # all conf 0.05 < 0.1
+    assert _bbox_from_kpts(kp) is None
+    one = [0.0, 0.0, 0.0] * 17           # only 1 visible joint
+    one[0], one[1], one[2] = 0.4, 0.4, 0.9
+    assert _bbox_from_kpts(one) is None
+
+
+def test_bbox_from_kpts_bad_length():
+    """Wrong-length input -> None (no crash)."""
+    assert _bbox_from_kpts(None) is None
+    assert _bbox_from_kpts([0.1, 0.2, 0.3]) is None
 
 
 def test_box_head_forward():

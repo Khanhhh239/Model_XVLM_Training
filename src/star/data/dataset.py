@@ -109,6 +109,29 @@ def _bbox_from_vitpose(vitpose_dict: dict, image_id: str, image_path: str) -> li
     return [(x1 + x2) / 2, (y1 + y2) / 2, w, h]
 
 
+def _bbox_from_kpts(kpts_flat, conf_thresh: float = 0.1, margin: float = 0.05) -> list[float] | None:
+    """Derive a person bbox (COCO xywh normalized) from flattened [x,y,c]*17 NORMALIZED keypoints.
+    Fallback for the box head when the manifest has a `keypoints` column but no bbox/vitpose-json
+    (the build script stores keypoints as x/W,y/H,c in [0,1]). Box = extent of visible keypoints
+    (conf>thresh) + margin, clamped to [0,1]."""
+    if not kpts_flat or len(kpts_flat) != 17 * 3:
+        return None
+    xs, ys = [], []
+    for k in range(17):
+        x, y, c = kpts_flat[3 * k], kpts_flat[3 * k + 1], kpts_flat[3 * k + 2]
+        if c > conf_thresh and (x > 0 or y > 0):
+            xs.append(x)
+            ys.append(y)
+    if len(xs) < 2:                       # need at least 2 visible joints for a meaningful box
+        return None
+    x1 = max(0.0, min(xs) - margin)
+    y1 = max(0.0, min(ys) - margin)
+    x2 = min(1.0, max(xs) + margin)
+    y2 = min(1.0, max(ys) + margin)
+    w, h = max(x2 - x1, 1e-4), max(y2 - y1, 1e-4)
+    return [(x1 + x2) / 2, (y1 + y2) / 2, w, h]
+
+
 def _xyxy_to_coco_xywh_norm(x1, y1, x2, y2, w_ref: float, h_ref: float) -> list[float]:
     """Convert pixel VOC xyxy to normalized center COCO xywh."""
     bw = max(x2 - x1, 1e-4) / w_ref
@@ -242,7 +265,12 @@ class PABDataset(Dataset):
         img = self._load_image(image_path)
         img_w, img_h = img.size
 
-        # Bbox: manifest COCO xywh, vitpose, or external boxes_jsonl
+        # Keypoints (manifest column or vitpose json) — also feeds the bbox fallback below
+        kpts_raw = _parse_kpts(row.get("keypoints")) if "keypoints" in self.df.columns else None
+        if kpts_raw is None:
+            kpts_raw = _kpts_from_vitpose(self.vitpose_dict, image_id, image_path)
+
+        # Bbox: manifest COCO xywh -> vitpose json -> external boxes_jsonl -> keypoint extent
         bbox_coco = _parse_bbox(row.get("bbox"))
         if bbox_coco is None:
             bbox_coco = _bbox_from_vitpose(self.vitpose_dict, image_id, image_path)
@@ -250,6 +278,8 @@ class PABDataset(Dataset):
             bbox_coco = self.boxes_dict[image_id]
         if bbox_coco is None and image_path in self.boxes_dict:
             bbox_coco = self.boxes_dict[image_path]
+        if bbox_coco is None and kpts_raw is not None:   # derive person box from keypoint extent
+            bbox_coco = _bbox_from_kpts(kpts_raw)
 
         bbox_voc = None
         if bbox_coco is not None:
@@ -261,10 +291,6 @@ class PABDataset(Dataset):
             else:
                 x, y, bw, bh = bbox_coco
                 bbox_voc = [x, y, x + bw, y + bh]
-
-        kpts_raw = _parse_kpts(row.get("keypoints")) if "keypoints" in self.df.columns else None
-        if kpts_raw is None:
-            kpts_raw = _kpts_from_vitpose(self.vitpose_dict, image_id, image_path)
 
         # phrase-grounded boxes -> pixel xyxy in THIS image's coords (boxes stored pixel @ src_size)
         phr_strs, phr_voc = [], []
