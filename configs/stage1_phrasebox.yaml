@@ -50,8 +50,11 @@ loss:
   lambda_action: 0.0
   lambda_phrase_box: 0.1         # START LOW — GT is noisy GroundingDINO; ramp protects the warm-start.
                                  # If VAL-B holds/rises, raise to 0.2 next run.
-  phrase_box_p: 4                # top-4 nouns/image by score (covers clothing + main objects). Higher P
-                                 # = more nouns but B*P cross-encodes get heavy on T4 — 4 is the balance.
+  phrase_box_p: 6                # top-6 nouns/image by score. boxes_30k has ~9.8 boxes/image (already
+                                 # pre-filtered at score>=0.3) -> P=6 covers clothing + main objects +
+                                 # key scene context (user: nouns like lake/walls/animals matter). Each
+                                 # noun = one B*P cross-encode; P=6 @ batch8 is the T4-safe ceiling. If
+                                 # Cell-6 smoke OOMs, drop to 4 or batch_size 8->6. A100 can push 8-10.
   phrase_box_rampup: 500
   xbm_enabled: false
   weighting: fixed
