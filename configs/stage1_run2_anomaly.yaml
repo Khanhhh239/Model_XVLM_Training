@@ -68,7 +68,9 @@ train:
   amp_dtype: fp16
   grad_checkpointing: true
   eval_every_epochs: 0.5
-  early_stop_patience: 2
+  early_stop_patience: 4         # raised 2->4: a fresh head dips during ramp then recovers; from a
+                                 # high safety floor, patience=2 kills it mid-recovery (Run 2 was
+                                 # rising 0.8115->0.8289 when cut). 4 = 2 epochs to recover AND exceed.
   grad_norm_every: 0
   seed: 42
   out_dir: /kaggle/working/out_stage1_run2
