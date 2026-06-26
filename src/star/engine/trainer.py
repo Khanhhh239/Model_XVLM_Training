@@ -44,7 +44,8 @@ class Trainer:
 
         self.out_dir = Path(cfg.train.out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        self.best_metric = -1.0
+        self.best_metric = -1.0     # FLOOR for best.pth (warm-init baseline); only ship if we beat it
+        self.run_best = -1.0        # this run's OWN best mAP — drives early-stop (decoupled from floor)
         self.bad_evals = 0
         self.step = 0
         self.start_epoch = 0
@@ -287,14 +288,23 @@ class Trainer:
         cfg_dict = to_dict(self.cfg)
         save_checkpoint(str(self.out_dir / "last.pth"), self.model, self.optimizer,
                         self.scheduler, self.step, self.best_metric, {"cfg": cfg_dict})
+        # best.pth = SHIPPABLE checkpoint: overwrite ONLY when we beat the FLOOR (warm-init 0.8323)
         if metric > self.best_metric:
             self.best_metric = metric
-            self.bad_evals = 0
             save_checkpoint(str(self.out_dir / "best.pth"), self.model, self.optimizer,
                             self.scheduler, self.step, self.best_metric,
                             {"report": rep, "cfg": cfg_dict})
-            log.info(f"[VAL-B] new best mAP={metric:.4f} -> saved best.pth")
+            log.info(f"[VAL-B] new best mAP={metric:.4f} -> saved best.pth (beats floor)")
+        # Early-stop tracks THIS RUN'S OWN trajectory, NOT the floor. A fresh head can climb steadily
+        # while still below the floor (Run 2: 0.81->0.83); counting those as "bad" kills it mid-learning.
+        # Reset patience whenever the run improves over its own best by a real margin (>1e-3).
+        if metric > self.run_best + 1e-3:
+            self.run_best = metric
+            self.bad_evals = 0
+            log.info(f"[VAL-B] run improved to {metric:.4f} (floor={self.best_metric:.4f}) -> patience reset")
         else:
             self.bad_evals += 1
+            log.info(f"[VAL-B] no run improvement ({metric:.4f} <= {self.run_best:.4f}) -> "
+                     f"bad_evals={self.bad_evals}/{self.cfg.train.early_stop_patience}")
         self.model.train()
         return self.bad_evals >= self.cfg.train.early_stop_patience
