@@ -1,0 +1,79 @@
+# STAGE 1.5 — pose + phrase-box (ONE lever on top of the proven safe recipe).
+# Rationale (user insight): unlike box/anomaly which only reshape the IMAGE encoder and are fully
+# discarded at inference, the phrase-box head feeds through backbone.cross_feature — the SAME
+# cross-encoder the ITM RERANK uses at inference. So training it grounds each noun-phrase to a region
+# and leaves a lasting imprint on the fusion attention that rerank benefits from.
+# Keep min_score permissive (loader default 0.3 keeps scene-context nouns like "lake"/"walls"); use a
+# moderate P so the high-signal clothing/object nouns are covered without exploding B*P cross-encodes.
+# Run:  python scripts/train.py --config configs/stage1_phrasebox.yaml --init-from <best (4).pth>
+
+data:
+  manifest: /kaggle/working/manifest_30k_hard_enhanced.parquet
+  image_root: /kaggle/input/aicity-30k-hard-enhanced/data/train_webp
+  image_size: 384
+  max_token: 100
+  lhp_enabled: true               # LHP + sim2real aug — part of the 0.80 recipe
+  lhp_min_scale: 0.5
+  lhp_use_bbox: true
+  group_by: pair                  # PairBatchSampler — the proven lever
+  group_fraction: 0.5
+  num_workers: 2
+  vitpose_json: null
+  boxes_json: null
+  phrase_boxes_json: /kaggle/input/bbox-dataset/boxes_30k.jsonl  # notebook fills the real path
+  remine_each_epoch: false        # OFF — pure pair-batch (one lever at a time)
+  mine_fraction: 0.0
+  hard_edges_json: null
+
+model:
+  backbone: xvlm
+  checkpoint: /kaggle/input/ckpt-30k-hard/xvlm_16m_base.th
+  embed_dim: 256
+  lora_enabled: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_targets: [query, value]
+  lora_freeze_text: true
+  pose_enabled: true              # already in best(3) — ON (user: "add pose"; it was never off)
+  pose_hidden: 256
+  bbox_enabled: false             # OFF — only touches image encoder, low ROI (Run 3 skipped)
+  anomaly_enabled: false          # OFF — Run 2 showed null gain
+  phrase_box_enabled: true        # ← the one lever: grounds nouns via the rerank cross-encoder
+
+loss:
+  w_itc: 1.0
+  lambda_itm: 2.0                 # main rank-1 lever (kept)
+  lambda_smooth_ap: 0.2          # kept
+  lambda_box: 0.0
+  lambda_anomaly: 0.0
+  lambda_action: 0.0
+  lambda_phrase_box: 0.1         # START LOW — GT is noisy GroundingDINO; ramp protects the warm-start.
+                                 # If VAL-B holds/rises, raise to 0.2 next run.
+  phrase_box_p: 4                # top-4 nouns/image by score (covers clothing + main objects). Higher P
+                                 # = more nouns but B*P cross-encodes get heavy on T4 — 4 is the balance.
+  phrase_box_rampup: 500
+  xbm_enabled: false
+  weighting: fixed
+  itc_temp_init: 0.07
+  smooth_ap_temp: 0.01
+
+optim:
+  lr_lora: 1.5e-5
+  lr_head: 1.0e-4
+  weight_decay: 0.02
+  betas: [0.9, 0.999]
+  grad_clip: 5.0
+  warmup_epochs: 0.5
+  epochs: 6
+
+train:
+  batch_size: 8                  # phrase-box B*P cross-encodes are heavy -> 8 (was 12 for safe)
+  grad_accum: 3                  # effective 24
+  amp_dtype: fp16
+  grad_checkpointing: true
+  eval_every_epochs: 0.5
+  early_stop_patience: 4         # fresh head dips-then-recovers; give 2 epochs to exceed the floor
+  grad_norm_every: 0
+  seed: 42
+  out_dir: /kaggle/working/out_stage1_phrasebox
