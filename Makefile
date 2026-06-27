@@ -11,15 +11,15 @@ lint:
 	ruff check src tests scripts
 	black --check src tests scripts
 
-# NOTE: the data manifest + images are delivered by the DATA TEAM (docs/02_DATA_CONTRACT.md).
+# NOTE: on Kaggle use notebooks/kaggle_stage15_best3.ipynb; these targets are for local smoke runs.
 overfit:
-	python scripts/train.py --config configs/star_v3_100k.yaml --overfit-one-batch
+	python scripts/train.py --config configs/stage1_safe_warmstart.yaml --overfit-one-batch
 
 train:
-	python scripts/train.py --config configs/star_v3_100k.yaml
+	python scripts/train.py --config configs/stage1_safe_warmstart.yaml
 
 eval:
-	python scripts/evaluate.py --config configs/star_v3_100k.yaml --ckpt checkpoints/best.pth
+	python scripts/evaluate.py --config configs/stage1_safe_warmstart.yaml --ckpt checkpoints/best.pth
 
 clean:
 	rm -rf __pycache__ .pytest_cache .coverage htmlcov outputs/tmp

@@ -1,8 +1,8 @@
-"""Train STAR-v3.
+"""Train STARModel (Stage 1.5).
 
 Usage:
-    python scripts/train.py --config configs/star_v3_100k.yaml
-    python scripts/train.py --config configs/star_v3_100k.yaml --overfit-one-batch
+    python scripts/train.py --config configs/stage1_safe_warmstart.yaml --init-from <best.pth>
+    python scripts/train.py --config configs/stage1_safe_warmstart.yaml --overfit-one-batch
 """
 from __future__ import annotations
 

@@ -1,8 +1,8 @@
-# STAGE 1.5 — Run 3: Run 2 config + bbox_head
-# Use AFTER Run 2 (stage1_run2_anomaly.yaml) confirms mAP > Run 1.
-# ONE lever: bbox_head (single person-box from ViTPose) — person localization.
-# ViTPose bbox is clean signal; box ramp 500 steps reduces disruption.
-# Run:  python scripts/train.py --config configs/stage1_run3_bbox.yaml --init-from <best.pth from Run2>
+# STAGE 1.5 — BBOX: baseline (pair-batch + ITM + Smooth-AP + pose) + person-box head.
+# bbox_head (single person-box) + anomaly_head; GT box derived from the manifest keypoint extent
+# (_bbox_from_kpts) since there is no vitpose-json / bbox column on Kaggle. Box loss ramps over 500
+# steps to avoid disrupting the warm-init. Warm-init from best (4).pth (baseline 0.8323).
+# Run:  python scripts/train.py --config configs/stage1_run3_bbox.yaml --init-from <best (4).pth>
 
 data:
   manifest: /kaggle/working/manifest_30k_hard_enhanced.parquet

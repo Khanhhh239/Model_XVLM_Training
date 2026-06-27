@@ -6,8 +6,8 @@ as additional ITM negatives in subsequent epochs.
 
 Usage:
     python scripts/mine_hard_negatives.py \\
-        --config configs/stage1_30k_kaggle_t4.yaml \\
-        --ckpt outputs/stage1_30k_t4/last.pth \\
+        --config configs/stage1_safe_warmstart.yaml \\
+        --ckpt outputs/last.pth \\
         --output data/mined_hard_negatives.json \\
         --top_k 5
 
