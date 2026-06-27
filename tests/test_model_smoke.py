@@ -63,10 +63,29 @@ def test_pose_fused_at_eval_when_enabled():
     ids = torch.randint(5, 900, (2, 16))
     mask = torch.ones(2, 16, dtype=torch.long)
     kpts = torch.rand(2, 51)
+    # out_proj inits to 0 (exact identity, protects warm-init); make it non-trivial (simulating a
+    # trained module) to verify the cross-attention fusion actually moves the eval feature.
     with torch.no_grad():
+        torch.nn.init.normal_(model.pose.cross_attn.out_proj.weight, std=0.1)
         f_plain, _ = model.encode_for_eval(img, ids, mask)
         f_pose, _ = model.encode_for_eval(img, ids, mask, keypoints=kpts)
     assert not torch.allclose(f_plain, f_pose), "pose branch must change eval image features"
+
+
+def test_pose_exact_identity_at_init_protects_warm_start():
+    # fresh pose module (out_proj=0) MUST be an exact identity -> warm-init baseline stays ~0.83
+    cfg = _tiny_cfg()
+    cfg.model.pose_enabled = True
+    model = STARModel(cfg)
+    model.eval()
+    img = torch.randn(2, 3, 384, 384)
+    ids = torch.randint(5, 900, (2, 16))
+    mask = torch.ones(2, 16, dtype=torch.long)
+    kpts = torch.rand(2, 51)
+    with torch.no_grad():
+        f_plain, _ = model.encode_for_eval(img, ids, mask)
+        f_pose, _ = model.encode_for_eval(img, ids, mask, keypoints=kpts)
+    assert torch.allclose(f_plain, f_pose, atol=1e-5), "pose must be exact identity at init (warm-start safety)"
 
 
 def test_overfit_one_batch_decreases_loss():

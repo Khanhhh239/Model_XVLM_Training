@@ -1,0 +1,80 @@
+# STAGE 1.5 (POSE-CA) — rebuild pose as SSDC-Eq1 heatmap cross-attention, warm-init from best (4).pth.
+# Diagnosis (460 wrong cases, filename=score): 64% rank-1 score >=0.99, 47% top1-top2 margin <0.01;
+# GT vs wrong rank-1 are the SAME person/scene/video differing ONLY in the pose/action moment
+# (e.g. dumbbell "falling" vs "held"). The old pose (global gated-sum on the POOLED feature) was too
+# weak and never reached the ITM rerank. New pose fuses 17-kpt heatmaps via Pose Conv + cross-attention
+# INTO the image token stream (img_embeds) -> helps BOTH the bi-encoder (CLS) AND the ITM rerank.
+# bbox/anomaly/phrase heads are OFF: they ground "where the person is", but here GT & distractor share
+# the location -> zero discriminative value + fresh-head noise.
+# Run:  python scripts/train.py --config configs/stage1_pose_ca.yaml --init-from "<best (4).pth>"
+
+data:
+  manifest: /kaggle/working/manifest_30k_hard_enhanced.parquet
+  image_root: /kaggle/input/aicity-30k-hard-enhanced/data/train_webp
+  image_size: 384
+  max_token: 100
+  lhp_enabled: true               # LHP + sim2real aug — part of the 0.80 recipe
+  lhp_min_scale: 0.5
+  lhp_use_bbox: true
+  group_by: pair                  # PairBatchSampler — THE proven lever
+  group_fraction: 0.5
+  num_workers: 2
+  vitpose_json: /kaggle/input/aicity-30k-hard-enhanced/data/subsets/prepared/train_30k_hard_vitpose.json
+  boxes_json: null
+  phrase_boxes_json: null
+  remine_each_epoch: false
+  mine_fraction: 0.0
+  hard_edges_json: null
+
+model:
+  backbone: xvlm
+  checkpoint: /kaggle/input/ckpt-30k-hard/xvlm_16m_base.th   # base for construction; weights from --init-from best(4)
+  embed_dim: 256
+  lora_enabled: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_targets: [query, value]
+  lora_freeze_text: true
+  pose_enabled: true              # NEW pose: heatmap -> Pose Conv -> cross-attention (token-level)
+  pose_hidden: 256                # legacy (unused by the new module)
+  pose_heatmap_size: 48
+  pose_conv_ch: 128
+  pose_grid: 12
+  pose_n_heads: 8
+  bbox_enabled: false             # OFF — same-location confusion, no discriminative value
+  anomaly_enabled: false          # OFF
+  phrase_box_enabled: false       # OFF
+
+loss:
+  w_itc: 1.0
+  lambda_itm: 1.0                 # ITM coefficient = 1 (per request; ALBEF/X-VLM 1:1 ratio)
+  lambda_smooth_ap: 0.2          # kept
+  lambda_box: 0.0
+  lambda_anomaly: 0.0
+  lambda_action: 0.0
+  lambda_phrase_box: 0.0
+  xbm_enabled: false             # OFF — stale negatives hurt at this LR
+  weighting: fixed
+  itc_temp_init: 0.07
+  smooth_ap_temp: 0.01
+
+optim:
+  lr_lora: 1.5e-5                # gentle — protect the 0.83 warm-init
+  lr_head: 1.0e-4               # fresh pose module learns faster than LoRA (gate opens here)
+  weight_decay: 0.02
+  betas: [0.9, 0.999]
+  grad_clip: 5.0
+  warmup_epochs: 0.5
+  epochs: 6
+
+train:
+  batch_size: 12
+  grad_accum: 2                  # effective 24
+  amp_dtype: fp16
+  grad_checkpointing: true
+  eval_every_epochs: 0.5
+  early_stop_patience: 4         # fresh pose dips-then-recovers; give it room to exceed the floor
+  grad_norm_every: 0
+  seed: 42
+  out_dir: /kaggle/working/out_stage1_pose_ca

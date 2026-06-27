@@ -21,7 +21,7 @@ from ..losses.xbm_queue import XBMQueue
 from .backbone import build_backbone
 from .heads import AnomalyClassificationHead, BoxGroundingHead, PhraseBoxHead
 from .lora import count_trainable, mark_only_lora_trainable
-from .pose import PoseBranch
+from .pose import PoseHeatmapCrossAttn
 
 
 class STARModel(nn.Module):
@@ -33,8 +33,15 @@ class STARModel(nn.Module):
         # LoRA on image+cross only + freeze text tower (backbone owns the module layout)
         self.n_lora = self.backbone.setup_finetuning(cfg)
 
-        # pose branch fused into the image branch (toggle), no separate loss
-        self.pose = PoseBranch(cfg.model.embed_dim, hidden=cfg.model.pose_hidden) if cfg.model.pose_enabled else None
+        # pose branch (toggle): SSDC Eq1 heatmap->conv->cross-attn fused into the IMAGE TOKEN stream
+        # (img_embeds), sized to the backbone's patch-token width. No separate pose loss — trained
+        # through ITC/ITM/SmoothAP gradients on the pose-enhanced tokens.
+        self.pose = (PoseHeatmapCrossAttn(self.backbone.vision_width,
+                                          heatmap_size=cfg.model.pose_heatmap_size,
+                                          conv_ch=cfg.model.pose_conv_ch,
+                                          pose_grid=cfg.model.pose_grid,
+                                          n_heads=cfg.model.pose_n_heads)
+                     if cfg.model.pose_enabled else None)
 
         # STAGE 1: New heads for box grounding + anomaly classification
         self.bbox_head = BoxGroundingHead(cfg.model.embed_dim) if cfg.model.bbox_enabled else None
@@ -94,7 +101,10 @@ class STARModel(nn.Module):
         img_embeds, img_feat = self.backbone.encode_image(image)
         txt_embeds, txt_feat = self.backbone.encode_text(ids, mask)
         if self.pose is not None and "keypoints" in batch:
-            img_feat = self.pose(img_feat, batch["keypoints"])     # fuse pose into the image branch
+            # token-level pose fusion (SSDC Eq1): enhance img_embeds, then RE-POOL the bi-encoder
+            # feature. The enhanced img_embeds also flow into ITM below -> rerank is pose-aware.
+            img_embeds = self.pose(img_embeds, batch["keypoints"])
+            img_feat = self.backbone.pool_vision(img_embeds)
 
         n = img_feat.size(0)
         device = img_feat.device
@@ -224,8 +234,9 @@ class STARModel(nn.Module):
         If the pose branch is enabled, keypoints MUST be fused here too — otherwise the
         eval embedding space differs from the trained one (train/eval mismatch).
         """
-        _, img_feat = self.backbone.encode_image(image)
+        img_embeds, img_feat = self.backbone.encode_image(image)
         if self.pose is not None and keypoints is not None:
-            img_feat = self.pose(img_feat, keypoints)
+            img_embeds = self.pose(img_embeds, keypoints)          # token-level pose fusion (SSDC Eq1)
+            img_feat = self.backbone.pool_vision(img_embeds)
         _, txt_feat = self.backbone.encode_text(ids, mask)
         return img_feat, txt_feat

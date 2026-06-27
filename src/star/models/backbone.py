@@ -120,6 +120,7 @@ class DummyBackbone(nn.Module):
         self.tokenizer = SimpleTokenizer(vocab_size=vocab)
         self.net = _DummyXVLM(embed=embed_dim, vocab=vocab)
         self.cross_width = self.net.hidden          # dim of cross_feature() [CLS] (for PhraseBoxHead)
+        self.vision_width = self.net.hidden         # patch-token dim (pose cross-attn)
 
     def encode_image(self, image):
         return self.net.encode_image(image)
@@ -132,6 +133,10 @@ class DummyBackbone(nn.Module):
 
     def cross_feature(self, img_embeds, txt_embeds, txt_mask):
         return self.net.cross_feature(img_embeds, txt_embeds, txt_mask)
+
+    def pool_vision(self, img_embeds):
+        """Pool (possibly pose-enhanced) vision tokens -> normalized feature (mean pool, matches encode_image)."""
+        return F.normalize(self.net.img_proj(img_embeds.mean(dim=1)), dim=-1)
 
     def setup_finetuning(self, cfg) -> int:
         """Inject LoRA (image + cross only) and freeze the text tower per the plan.
@@ -204,6 +209,7 @@ class XVLMBackbone(nn.Module):
         self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         self.temp = self.model.temp     # share the PRETRAINED temperature with ITCLoss (fix #6)
         self.cross_width = getattr(self.model, "text_width", 768)   # cross_feature [CLS] dim (PhraseBoxHead)
+        self.vision_width = getattr(self.model, "vision_width", 1024)  # patch-token dim (pose cross-attn)
 
     # ----- interface used by STARModel -----
     def encode_image(self, image):
@@ -225,6 +231,10 @@ class XVLMBackbone(nn.Module):
         img_atts = torch.ones(img_embeds.size()[:-1], dtype=torch.long, device=img_embeds.device)
         cross = self.model.get_cross_embeds(img_embeds, img_atts, text_embeds=txt_embeds, text_atts=txt_mask)
         return cross[:, 0, :]                          # [P, H] fused [CLS] (the vector ITM head reads)
+
+    def pool_vision(self, img_embeds):
+        """Pool (possibly pose-enhanced) vision tokens -> normalized bi-encoder feature (CLS proj)."""
+        return self.model.get_features(image_embeds=img_embeds)
 
     def setup_finetuning(self, cfg) -> int:
         from .lora import inject_lora

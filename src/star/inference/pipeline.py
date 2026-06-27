@@ -70,7 +70,10 @@ def encode_eval_set(model, dataset, device, batch_size: int = 64, num_workers: i
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
             img_embeds, img_feat = model.backbone.encode_image(image)
         if pose is not None and "keypoints" in batch:
-            img_feat = pose(img_feat.float(), batch["keypoints"].to(device).float())
+            # token-level pose fusion (SSDC Eq1): enhance img_embeds, re-pool the bi-encoder feature.
+            # The cached gallery_embeds below are now pose-enhanced -> the ITM rerank is pose-aware too.
+            img_embeds = pose(img_embeds.float(), batch["keypoints"].to(device).float())
+            img_feat = model.backbone.pool_vision(img_embeds)
         for r in range(image.size(0)):
             iid = batch["image_id"][r]
             if iid not in id_to_pos:

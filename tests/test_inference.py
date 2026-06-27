@@ -208,9 +208,11 @@ def test_pipeline_pose_enabled_checkpoint_without_keypoints(tmp_path):
 
 
 def test_pipeline_fuses_pose_when_keypoints_present(tmp_path):
-    """With a pose branch AND keypoints in the manifest, the pipeline fuses pose into the image
-    feature (matching a pose-ON checkpoint), so the gallery features differ from the pose-OFF run.
-    This is the 'eval v3c WITH ViTPose keypoints' path."""
+    """With a pose branch AND keypoints, the pipeline fuses pose at the TOKEN level (SSDC Eq1):
+    the enhanced img_embeds change BOTH the pooled gallery_feats (bi-encoder) AND the gallery_embeds
+    the cross-encoder reads (so the ITM rerank is pose-aware too — the upgrade over the old pooled-sum
+    where 'ITM never saw pose'). A fresh module is an exact identity (out_proj=0); perturb out_proj to
+    simulate a trained pose head before checking it moves the features."""
     import numpy as np
     import pandas as pd
     import torch
@@ -237,12 +239,13 @@ def test_pipeline_fuses_pose_when_keypoints_present(tmp_path):
     cfg.model.embed_dim = 32
     cfg.model.pose_enabled = True
     model = STARModel(cfg)
+    torch.nn.init.normal_(model.pose.cross_attn.out_proj.weight, std=0.1)  # simulate a trained pose head
     tok = model.backbone.tokenizer
     enc_no = encode_eval_set(model, PABDataset(str(p_no), str(tmp_path), tok, split="valb", train=False),
                              "cpu", batch_size=6, num_workers=0)
     enc_yes = encode_eval_set(model, PABDataset(str(p_yes), str(tmp_path), tok, split="valb", train=False),
                               "cpu", batch_size=6, num_workers=0)
-    # pose fusion changed the GLOBAL image features...
+    # token-level pose fusion changes BOTH the pooled bi-encoder feature...
     assert not torch.allclose(enc_no["gallery_feats"], enc_yes["gallery_feats"])
-    # ...but NOT the region embeds the cross-encoder uses (ITM never sees pose)
-    assert torch.allclose(enc_no["gallery_embeds"].float(), enc_yes["gallery_embeds"].float())
+    # ...AND the region embeds the cross-encoder reads (ITM rerank is now pose-aware)
+    assert not torch.allclose(enc_no["gallery_embeds"].float(), enc_yes["gallery_embeds"].float())

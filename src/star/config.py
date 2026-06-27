@@ -49,9 +49,13 @@ class ModelConfig:
     lora_dropout: float = 0.05
     lora_targets: tuple[str, ...] = ("query", "value")
     lora_freeze_text: bool = True     # PLAN: text encoder FROZEN (no LoRA) — adapt image+cross only
-    # pose branch (toggle) — fused into the IMAGE-encoder branch, no separate pose loss
+    # pose branch (toggle) — SSDC Eq1 heatmap->conv->cross-attn fused into the IMAGE TOKEN stream
     pose_enabled: bool = False
-    pose_hidden: int = 256
+    pose_hidden: int = 256            # (legacy; kept for config back-compat, unused by the new module)
+    pose_heatmap_size: int = 48       # Gaussian heatmap render resolution (the "pose map")
+    pose_conv_ch: int = 128           # Pose Conv Module hidden channels
+    pose_grid: int = 12               # pose-token grid -> g*g pose tokens (cross-attn key/value)
+    pose_n_heads: int = 8             # cross-attention heads
     # STAGE 1: New heads
     bbox_enabled: bool = False        # Box grounding head (single person-box, spatial understanding)
     anomaly_enabled: bool = False     # Anomaly classification head (normal vs abnormal)
