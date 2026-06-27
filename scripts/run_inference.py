@@ -35,7 +35,7 @@ def main():
     ap.add_argument("--manifest", required=True, help="eval parquet (valb rows; empty caption = distractor)")
     ap.add_argument("--image-root", required=True)
     ap.add_argument("--base-ckpt", default=None, help="X-VLM base weights (model construction)")
-    ap.add_argument("--config", default="configs/star_v3_10k_kaggle.yaml")
+    ap.add_argument("--config", default="configs/stage1_safe_warmstart.yaml")
     ap.add_argument("--out-dir", default="infer_out")
     ap.add_argument("--topk", type=int, default=100)
     ap.add_argument("--batch-size", type=int, default=64)

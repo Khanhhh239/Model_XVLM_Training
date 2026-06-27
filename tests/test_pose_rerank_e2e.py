@@ -77,7 +77,7 @@ def test_pose_rerank_end_to_end(tmp_path):
     r = subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "pose_rerank.py"),
          "--best", str(ckpt), "--base-ckpt", str(ckpt),
-         "--config", str(ROOT / "configs" / "star_v3_10k_kaggle.yaml"),
+         "--config", str(ROOT / "configs" / "stage1_safe_warmstart.yaml"),
          "--answer", str(tmp_path / "answer.txt"),
          "--query-json", str(tmp_path / "query_text.json"),
          "--query-index", str(tmp_path / "query_index.txt"),

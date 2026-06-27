@@ -1,192 +1,119 @@
-# STAR-v3 — Training Codebase
-### AI City 2026 Track 4 — Text-Based Person Anomaly Retrieval (Sim2Real, 36K-distractor gallery)
+# STAR — Stage 1.5 Training Codebase
+### AI City 2026 Track 4 — Text-Based Person Anomaly Retrieval (Sim2Real)
 
-Production training pipeline for the **STAR-v3** model. Built to the annotated plan:
-**X-VLM** backbone with **LoRA on the image + cross encoders only** (the **text encoder is frozen**),
-trained with **`L = ITC + λ₁·ITM + λ₂·Smooth-AP`** (MLM removed), with **hard-negative mining** and
-**all_gather** contrastive (XBM removed — review fix #4), optional **LHP** augmentation and a
-**pose branch** fused into the image side.
+Fine-tuning pipeline for **STARModel** (X-VLM 16M + LoRA + pose), warm-started from a checkpoint
+that scores **mAP 0.8323 / R@1 ~0.71 / R@10 0.99** on the 30k-hard VAL-B (synthetic, leakage-free
+split by video). The goal of Stage 1.5 is to **sharpen rank-1** on top of that warm-init.
 
-> Full math + code walkthrough: **[`analyze.md`](analyze.md)**.
+> Full algorithm + loss math + design rationale: **[`analyze.md`](analyze.md)**.
 
 ---
 
-## 1. Architecture (training)
+## 1. Architecture
 
 ```
- Synthetic Img ~100K (.webp 384)             Caption (LLM-rewritten)
-        │                                            │
-   (A) LHP augmentation [toggle]                     │
-        │                                            │
- (B) X-VLM Image Encoder · Swin-B  [LoRA]    (E) X-VLM Text Encoder · BERT[0:6]  [FROZEN]
-        │   └─(K) Pose branch [toggle] → fuse f_V    │
-        │   → f_V                                    │   → f_T
-        └───────────────────┬────────────────────────┘
-                            │
-        ┌───────────────────┴───────────────────┐
-        │ (F) ITC  cos(f_V,f_T) · identity soft  │  ← (J) Hard-Neg + all_gather + smart sampler
-        │     targets (ALBEF/X-VLM)              │
-        │ (G+) Smooth-AP  (train ≈ mAP)          │
-        └───────────────────┬───────────────────┘
-                            │
-            (G) X-VLM Cross-Encoder · BERT[6:12]  [LoRA]
-                            │
-                  (H) ITM head → ITM loss   (hard negatives)
-                            │
-        L = ITC + λ₁·ITM + λ₂·Smooth-AP
-                            │
-   Backprop → LoRA(Swin image) + LoRA(Cross) + ITM head (+ pose).  Text tower stays FROZEN.
+ Image (.webp 384, LHP + sim2real aug)              Caption
+        │                                              │
+ X-VLM Image Encoder · Swin-B  [LoRA qkv]      X-VLM Text Encoder · BERT[0:6]  [FROZEN]
+        │   └─ Pose branch (keypoint-MLP) → fuse       │
+        │   → f_V                                      │ → f_T
+        └──────────────────┬────────────────────────── ┘
+                           │  ITC (cosine, identity soft targets) + Smooth-AP  ← PairBatchSampler
+        X-VLM Cross-Encoder · BERT[6:12]  [LoRA query/value]
+                           │  → ITM head (hard-neg)  [used by inference rerank]
+        L = ITC + 2·ITM + 0.2·Smooth-AP   (+ optional box / anomaly heads)
 ```
 
-| Component | State | Trains? |
-|---|---|---|
-| Image encoder (Swin-B) | **LoRA** | ✅ adapters |
-| Cross-encoder (BERT 6–12) | **LoRA** | ✅ adapters |
-| **Text encoder (BERT 0–6)** | **FROZEN** | ❌ (preserves language prior; domain shift is image-side) |
-| ITM head, image proj, ITC temp | TRAIN | ✅ |
-| Pose branch | toggle | ✅ via ITC gradient (no separate loss) |
-| LHP augmentation | toggle | — (dataloader only) |
-| MLM | **removed** | — |
+| Component | State |
+|---|---|
+| Image encoder (Swin-B) | LoRA `qkv` |
+| Cross-encoder (BERT 6–12) | LoRA `query/value` — **the module the ITM rerank uses at inference** |
+| Text encoder (BERT 0–6) | **FROZEN** |
+| Pose branch (keypoint-MLP) | ON (part of the warm-init), fused into f_V |
+| ITM head, image proj, ITC temp | trained |
+| bbox head (optional) | person-box from keypoint extent — `stage1_run3_bbox.yaml` only |
 
-**Loss:** `L = w_itc·ITC + λ₁·ITM(hard-neg) + λ₂·Smooth-AP`  (defaults `w_itc=1, λ₁=1, λ₂=0.3`).
-ITC:ITM = 1:1 is the proven X-VLM ratio; **sweep λ₂ ∈ {0, 0.1, 0.3, 1.0} on VAL-B**. Dynamic
-weighting is available as an ablation (`loss.weighting: uncertainty | dwa`, Kendall/DWA — applied
-on top of the base weights), plus a per-loss grad-norm diagnostic (`train.grad_norm_every`).
-See `analyze.md` §14.
+**Warm-init:** `scripts/train.py --init-from <best.pth>` loads `backbone.model.*` + `pose.*` + LoRA
+(strict=False) on top of the vanilla X-VLM base (`xvlm_16m_base.th`). Fresh heads stay random.
+
+**Safety floor:** the trainer evals the warm-init at step 0 and sets that as `best_metric`; `best.pth`
+is overwritten **only** when a later eval beats it. Early-stop tracks the run's **own** best
+(decoupled from the floor) so a slowly-recovering head isn't killed mid-learning.
 
 ---
 
-## 2. Repo layout
+## 2. Configs (only two are kept)
+
+| Config | What |
+|---|---|
+| [`configs/stage1_safe_warmstart.yaml`](configs/stage1_safe_warmstart.yaml) | **BASELINE** — pair-batch + ITM + Smooth-AP + pose. The recipe that produced 0.8323. |
+| [`configs/stage1_run3_bbox.yaml`](configs/stage1_run3_bbox.yaml) | **BBOX** — baseline + person-box head (BoxGroundingHead; GT derived from keypoint extent). |
+
+> Other levers tried and **dropped** (none beat 0.8323 on VAL-B): anomaly head, phrase-box head,
+> XBM + ANCE re-mining. See §5.
+
+---
+
+## 3. Run on Kaggle (T4)
+
+Canonical notebook: **[`notebooks/kaggle_stage15_best3.ipynb`](notebooks/kaggle_stage15_best3.ipynb)**
+(Accelerator = T4 GPU, Internet = ON). It git-clones this repo, builds the pinned X-VLM env via
+`scripts/kaggle_setup.py` (transformers 4.12.5 + X-VLM source + 4 patches), locates the datasets,
+(re)builds the manifest, and trains.
+
+**Each run, change two things:**
+1. Cell-5: `CONFIG = "configs/stage1_safe_warmstart.yaml"` (or `stage1_run3_bbox.yaml`)
+2. Cell-7: `INIT_NAME = "best (4).pth"` (the warm-init checkpoint to load; `None` → use `best (3).pth`)
+
+Required Kaggle datasets: `aicity-30k-hard-enhanced` (webp + jsonl + vitpose), `ckpt-30k-hard`
+(`xvlm_16m_base.th` + manifest parquet), the warm-init `.pth`, and (for phrase-box only) `bbox-dataset`.
+
+Watch at startup: `[baseline] warm-init VAL-B mAP=0.8323`, then per-eval `[VAL-B] ... R@1 ...`.
+
+---
+
+## 4. Inference (rerank)
+
+```bash
+python scripts/run_inference.py --ckpt best.pth --manifest <valb.parquet> \
+    --image-root <webp> --base-ckpt xvlm_16m_base.th --topk 100
 ```
-train2/
-├── README.md            # this file (architecture + how to run)
-├── analyze.md           # full algorithm + code analysis (math, papers, fidelity)
-├── configs/star_v3_100k.yaml
+Pipeline: cosine Stage-1 → Top-100 → **ITM cross-encoder rerank** → Gale-Shapley → top-10. Reports
+metrics at **every** stage, so `rerank` vs `stage1` shows the cross-encoder's R@1 lift directly.
+
+---
+
+## 5. Findings (honest status)
+
+- **Bi-encoder VAL-B is saturated at ~0.8323.** Pair-batch + ITM + Smooth-AP (the warm-init recipe)
+  is the ceiling. Across four fine-tune experiments, **no auxiliary training lever beat it**:
+  anomaly head (null), phrase-box head (0.8264, hurts the bi-encoder slightly), XBM + ANCE
+  (0.80, XBM drift confirmed — `itc` oscillates, doesn't converge).
+- **The gap is rank-1 ordering, not recall** (R@10 0.99 vs R@1 0.71) → the highest-ROI lever is the
+  **inference ITM rerank** (§4), not more bi-encoder aux losses.
+- **VAL-B is synthetic and does not transfer 1:1 to the real test** (documented sim2real drop). For
+  the real goal, the training-side levers worth trying are **text-LoRA (unfreeze the text tower)** and
+  **caption augmentation / external real datasets** — not more heads.
+
+---
+
+## 6. Repo layout
+```
+├── README.md / analyze.md            # this file / full design + math reference
+├── configs/                          # stage1_safe_warmstart.yaml (baseline), stage1_run3_bbox.yaml
+├── notebooks/kaggle_stage15_best3.ipynb
 ├── src/star/
-│   ├── config.py        # typed config + YAML loader
-│   ├── metrics.py       # mAP / MRR / R@K
-│   ├── losses/          # itc (ALBEF/X-VLM faithful), smooth_ap, itm
-│   ├── modules/         # hard_neg (similarity-based negative sampling)
-│   ├── models/          # lora, pose, backbone (X-VLM wrapper + dummy), star_model
-│   ├── data/            # dataset (consumes manifest), transforms (LHP), sampler
-│   ├── engine/          # optim (AdamW + warmup-cosine), evaluator, trainer
-│   └── utils/           # seed, logging, checkpoint
-├── scripts/             # train.py, evaluate.py
-└── tests/               # 29 pytest unit tests (math-critical)
+│   ├── config.py · metrics.py
+│   ├── losses/   # itc, smooth_ap, itm, action, weighting
+│   ├── models/   # backbone (X-VLM wrapper), lora, pose, heads, star_model
+│   ├── data/     # dataset (manifest + keypoint→bbox), transforms (LHP), sampler, mining
+│   ├── engine/   # optim, evaluator, trainer (safety floor + decoupled early-stop)
+│   ├── inference/# pipeline (cosine → ITM rerank → Gale-Shapley)
+│   └── utils/
+├── scripts/      # train, run_inference, build_stage1_manifest, kaggle_setup, evaluate,
+│                 # pose_rerank, qwen_rerank, extract_pose_yolo, vitpose_extract
+└── tests/        # pytest unit + integration suite (run: PYTHONPATH=src pytest -q)
 ```
 
----
-
-## 3. How to run
-
-```bash
-# install
-python -m venv .venv && . .venv/Scripts/activate     # Windows
-pip install -r requirements.txt && pip install -e .
-
-# 1) sanity: math unit tests (no GPU, no data)
-pytest -q
-
-# 2) the DATA TEAM drops a ready manifest at manifests/star_v3.parquet
-#    + the .webp images under data.image_root  (schema in §4)
-
-# 3) sanity: overfit one batch (loss must fall toward 0 -> wiring is correct)
-python scripts/train.py --config configs/star_v3_100k.yaml --overfit-one-batch
-
-# 4) train
-python scripts/train.py --config configs/star_v3_100k.yaml
-#    override anything:  --set optim.lr_lora=1e-4 loss.lambda_smooth_ap=0.1
-
-# 5) evaluate a checkpoint on VAL-B (mAP / MRR / R@K)
-python scripts/evaluate.py --config configs/star_v3_100k.yaml --ckpt outputs/star_v3/best.pth
-```
-
-Without real X-VLM weights the code runs on a built-in **dummy backbone** so tests and the
-overfit check work offline. To use the real model, set `model.checkpoint` and implement
-`XVLMBackbone` (one integration point — see §5).
-
----
-
-## 4. Data contract (delivered by the DATA TEAM)
-
-This repo does **not** build or clean data. The data team provides a parquet **manifest**
-(one row per image–caption pair) + the images:
-
-| column | required | use |
-|---|---|---|
-| `image_path` | ✅ | path to the `.webp` (abs, or relative to `data.image_root`) |
-| `caption` | ✅ | text paired with the image. **In VAL-B, leave it empty for distractor rows** → that image joins the gallery but is never a query (review fix #3). |
-| `split` | ✅ | `train` / `valb` — **VAL-B must not share scene/identity with train** |
-| `image_id` | ⬜ | gallery identity (defaults to `image_path`); rows sharing it dedup to one gallery image |
-| `sequence_id` | ✅ | instance id for ITC / hard-neg masking (same-sequence frames aren't negatives) |
-| `scene` | ⬜ | smart-sampler grouping |
-| `action` | ⬜ | logging only |
-| `bbox` | ⬜ | normalized `[x,y,w,h]`; needed only if LHP person-crop is on |
-| `keypoints` | ⬜ | 17×3 flattened; needed only if the pose branch is on |
-
-Quick check the data team can run:
-```python
-import pandas as pd
-df = pd.read_parquet("manifests/star_v3.parquet")
-assert {"image_path","caption","split","sequence_id"} <= set(df.columns)
-tr, va = set(df[df.split=="train"].scene), set(df[df.split=="valb"].scene)
-assert tr.isdisjoint(va)   # no VAL-B leakage
-```
-
----
-
-## 5. Real X-VLM backbone (WIRED ✅)
-
-`src/star/models/backbone.py::XVLMBackbone` is implemented and **validated** against
-`third_party/X-VLM` + the **X-VLM 16M** checkpoint: it builds the model, loads the checkpoint
-(`missing_keys: []`), and the full STARModel trains with **48 LoRA layers** (Swin `qkv` + BERT
-`query/value` on fusion layers 6–11), **text tower frozen**, ITC reusing the pretrained `temp`.
-
-X-VLM needs `transformers==4.12.5` (incompatible with the main env), so it runs in a **separate
-pinned venv**. One-time setup (Python 3.11):
-
-```bash
-# 1. source code + checkpoint (≈825 MB)
-git clone --depth 1 https://github.com/zengyan-97/X-VLM third_party/X-VLM
-python -m gdown 1iXgITaSbQ1oGPPvGaV0Hlae4QiJG5gx0 -O data/checkpoints/xvlm_16m_base.th
-
-# 2. pinned venv (CPU wheel shown; for GPU use the cu121 torch wheel)
-python -m venv .venv-xvlm
-V=.venv-xvlm/Scripts/python.exe
-$V -m pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cpu
-$V -m pip install -r requirements-xvlm.txt
-$V -m pip install --no-deps transformers==4.12.5 timm==0.4.9   # old `tokenizers` is unbuildable on py311; we use a modern one
-
-# 3a. relax transformers' hard tokenizers pin (X-VLM uses its own pure-python tokenizer)
-$V -c "import transformers,re,pathlib as p; f=p.Path(transformers.__file__).parent/'dependency_versions_table.py'; f.write_text(re.sub(r'\"tokenizers\":[^,]+', '\"tokenizers\": \"tokenizers\"', f.read_text()))"
-# 3b. make X-VLM's CIDEr (captioning, unused) import optional
-$V -c "import pathlib as p; f=p.Path('third_party/X-VLM/utils/__init__.py'); s=f.read_text(); old='from utils.cider.pyciderevalcap.ciderD.ciderD import CiderD'; f.write_text(s.replace(old, 'try:\n    '+old+'\nexcept Exception:\n    CiderD = None')) if 'try:\n    '+old not in s else None"
-
-# 4. validate end-to-end, then train (in the pinned venv, pointing at the checkpoint)
-$V third_party/validate_star_xvlm.py
-$V scripts/train.py --config configs/star_v3_100k.yaml \
-   --set model.backbone=xvlm model.checkpoint=data/checkpoints/xvlm_16m_base.th
-```
-Probe/validation scripts: `third_party/probe_xvlm.py` (build+load+forward) and
-`third_party/validate_star_xvlm.py` (full STARModel LoRA + losses). The main-venv `pytest`
-keeps using the dummy backbone (the X-VLM import is lazy).
-
----
-
-## 6. Run on Kaggle (10K trial)
-
-Use **[`notebooks/kaggle_train_10k.ipynb`](notebooks/kaggle_train_10k.ipynb)** (Accelerator = **T4 GPU**,
-Internet = **ON**). It clones this repo, builds the pinned X-VLM env *without touching Kaggle's CUDA
-torch*, downloads the 16M checkpoint, and trains with [`configs/star_v3_10k_kaggle.yaml`](configs/star_v3_10k_kaggle.yaml)
-(batch 16 @384, fp16, 6 epochs + early-stop). The **DATA cell** is a placeholder: flip
-`USE_REAL_DATA=True` and point at the data team's Kaggle Dataset (schema in §4); until then a
-synthetic 10K manifest keeps the notebook runnable end-to-end (timing/pipeline test only).
-Estimated T4 time: **~45–100 min** (logs show the real s/step within the first minute).
-
-## 7. Status & honesty
-- ✅ losses / metrics / hard-neg / LoRA / optimizer / trainer / distractor-aware evaluator —
-  complete, **28 unit tests pass**.
-- ✅ **real X-VLM backbone wired + validated** (16M checkpoint, 48 LoRA layers, text frozen) — §5.
-- ⚠️ Smooth-AP(text), LHP, the pose branch, and the frozen-text choice are **not yet proven on PAB** —
-  every one is a toggle and must be confirmed on a distractor-heavy **VAL-B**. Do not trust the
-  leaderboard as validation. See `analyze.md` §15 (risks).
+Local dev uses a built-in dummy backbone so `pytest` runs offline; the real X-VLM import is lazy
+and only triggers when `model.backbone=xvlm`.

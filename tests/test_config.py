@@ -22,7 +22,7 @@ def test_parse_overrides_none_int_float_str():
 
 
 def test_override_false_actually_disables_flag_end_to_end():
-    cfg = load_config("configs/star_v3_10k_kaggle.yaml",
+    cfg = load_config("configs/stage1_safe_warmstart.yaml",
                       parse_overrides(["data.lhp_enabled=false", "model.lora_enabled=false"]))
     assert cfg.data.lhp_enabled is False and not cfg.data.lhp_enabled
     assert cfg.model.lora_enabled is False and not cfg.model.lora_enabled

@@ -83,8 +83,8 @@ def test_config_loads_stage15_yaml():
     from pathlib import Path
 
     from star.config import load_config
-    cfg_path = Path(__file__).resolve().parents[1] / "configs" / "stage1_warmstart_best3.yaml"
+    cfg_path = Path(__file__).resolve().parents[1] / "configs" / "stage1_run3_bbox.yaml"
     cfg = load_config(str(cfg_path))
-    assert cfg.loss.lambda_action > 0
-    assert cfg.data.remine_each_epoch is True
-    assert cfg.model.bbox_enabled and cfg.model.anomaly_enabled and cfg.loss.xbm_enabled
+    assert cfg.model.bbox_enabled and cfg.model.anomaly_enabled
+    assert cfg.loss.lambda_box > 0
+    assert cfg.model.pose_enabled is True

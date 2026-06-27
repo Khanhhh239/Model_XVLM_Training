@@ -76,7 +76,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--best", required=True)
     ap.add_argument("--base-ckpt", required=True)
-    ap.add_argument("--config", default="configs/star_v3_10k_kaggle.yaml")
+    ap.add_argument("--config", default="configs/stage1_safe_warmstart.yaml")
     ap.add_argument("--answer", required=True)
     ap.add_argument("--query-json", required=True)
     ap.add_argument("--query-index", required=True)
