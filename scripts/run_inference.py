@@ -41,6 +41,9 @@ def main():
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--no-gale-shapley", action="store_true")
+    ap.add_argument("--vitpose-json", default=None,
+                    help="ViTPose JSON for the gallery (required when model.pose_enabled=True "
+                         "to avoid train/inference mismatch in the bi-encoder branch)")
     ap.add_argument("--set", nargs="*", default=[], help="config overrides")
     args = ap.parse_args()
 
@@ -61,9 +64,15 @@ def main():
              f"| pose_enabled={cfg.model.pose_enabled} | train-best mAP={raw.get('best_metric')}")
     del raw
 
+    if cfg.model.pose_enabled and not args.vitpose_json:
+        log.warning("[pose] model.pose_enabled=True but --vitpose-json not set -> "
+                    "pose branch SKIPPED at inference (train/inference mismatch). "
+                    "Pass --vitpose-json <gallery_vitpose.json> to match training.")
+
     ds = PABDataset(args.manifest, args.image_root, model.backbone.tokenizer, split="valb",
-                    image_size=cfg.data.image_size, max_token=cfg.data.max_token, train=False)
-    log.info(f"eval rows={len(ds)}")
+                    image_size=cfg.data.image_size, max_token=cfg.data.max_token, train=False,
+                    vitpose_json=args.vitpose_json)
+    log.info(f"eval rows={len(ds)} | pose_at_inference={'ON' if args.vitpose_json else 'OFF'}")
 
     t0 = time.time()
     res = run_pipeline(model, ds, device, topk=args.topk, batch_size=args.batch_size,
